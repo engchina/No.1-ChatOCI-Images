@@ -19,6 +19,7 @@ import structlog
 from datetime import datetime, timedelta
 from typing import Optional, Tuple, Dict, Any
 from pathlib import Path
+import time
 
 from flask import Flask, Response, request, jsonify, abort, send_from_directory
 from flask_cors import CORS
@@ -352,6 +353,7 @@ def create_app(config_name: str = None) -> Flask:
                 data=file.stream,
                 content_type=file.content_type or 'application/octet-stream'
             )
+            time.sleep(7)
 
             # プロキシURL生成
             proxy_url = f"/img/{bucket}/{object_name}"
