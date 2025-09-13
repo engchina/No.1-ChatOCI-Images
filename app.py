@@ -20,24 +20,32 @@ from datetime import datetime, timedelta
 from typing import Optional, Tuple, Dict, Any
 from pathlib import Path
 import time
+import io
+import requests
+from urllib.parse import urlparse
+import mimetypes
 
-from flask import Flask, Response, request, jsonify, abort, send_from_directory
+from flask import Flask, Response, request, jsonify, send_from_directory
 from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from flask_talisman import Talisman
-from werkzeug.utils import secure_filename
-from werkzeug.exceptions import RequestEntityTooLarge
 
 import oci
 from oci.object_storage import ObjectStorageClient
-from oci.object_storage.models import CreatePreauthenticatedRequestDetails
 from oci.exceptions import ServiceError
 
 import sentry_sdk
 from sentry_sdk.integrations.flask import FlaskIntegration
 
 from config import settings, get_config
+
+# 標準ライブラリのloggingモジュールを設定
+import logging
+logging.basicConfig(
+    level=getattr(logging, settings.LOG_LEVEL.upper()),
+    format=settings.LOG_FORMAT
+)
 
 # 構造化ログの設定
 structlog.configure(
@@ -139,6 +147,101 @@ def allowed_file(filename: str) -> bool:
 
     extension = filename.rsplit('.', 1)[1].lower()
     return extension in settings.ALLOWED_EXTENSIONS
+
+
+def is_valid_image_url(url: str) -> bool:
+    """有効な画像URLかチェック（SSRF攻撃防止）"""
+    try:
+        parsed = urlparse(url)
+        # HTTPSまたはHTTPのみ許可
+        if parsed.scheme not in ['http', 'https']:
+            return False
+        # ローカルIPアドレスやプライベートIPアドレスを拒否
+        import ipaddress
+        import socket
+        
+        hostname = parsed.hostname
+        if not hostname:
+            return False
+            
+        # IPアドレスの場合はプライベートIPを拒否
+        try:
+            ip = ipaddress.ip_address(hostname)
+            if ip.is_private or ip.is_loopback or ip.is_link_local:
+                return False
+        except ValueError:
+            # ホスト名の場合はDNS解決してIPをチェック
+            try:
+                ip_str = socket.gethostbyname(hostname)
+                ip = ipaddress.ip_address(ip_str)
+                if ip.is_private or ip.is_loopback or ip.is_link_local:
+                    return False
+            except (socket.gaierror, ValueError):
+                return False
+                
+        return True
+    except Exception:
+        return False
+
+
+def download_image_from_url(url: str, max_size: int = None) -> Tuple[io.BytesIO, str, str]:
+    """URLから画像をダウンロード
+    
+    Returns:
+        Tuple[io.BytesIO, str, str]: (画像データ, content_type, ファイル名)
+    """
+    if max_size is None:
+        max_size = settings.MAX_CONTENT_LENGTH
+        
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (compatible; ImageProxy/1.0)'
+    }
+    
+    response = requests.get(
+        url, 
+        headers=headers, 
+        stream=True, 
+        timeout=30,
+        allow_redirects=True
+    )
+    response.raise_for_status()
+    
+    # Content-Typeチェック
+    content_type = response.headers.get('content-type', '')
+    if not content_type.startswith('image/'):
+        raise ValueError(f"無効なコンテンツタイプ: {content_type}")
+    
+    # ファイルサイズチェック
+    content_length = response.headers.get('content-length')
+    if content_length and int(content_length) > max_size:
+        raise ValueError(f"ファイルサイズが大きすぎます: {content_length} bytes")
+    
+    # 画像データをダウンロード
+    image_data = io.BytesIO()
+    downloaded_size = 0
+    
+    for chunk in response.iter_content(chunk_size=8192):
+        if chunk:
+            downloaded_size += len(chunk)
+            if downloaded_size > max_size:
+                raise ValueError(f"ファイルサイズが大きすぎます: {downloaded_size} bytes")
+            image_data.write(chunk)
+    
+    image_data.seek(0)
+    
+    # ファイル名を生成（URLから推測またはContent-Typeから生成）
+    parsed_url = urlparse(url)
+    filename = os.path.basename(parsed_url.path)
+    
+    if not filename or '.' not in filename:
+        # Content-Typeから拡張子を推測
+        extension = mimetypes.guess_extension(content_type)
+        if extension:
+            filename = f"image{extension}"
+        else:
+            filename = "image.jpg"  # デフォルト
+    
+    return image_data, content_type, filename
 
 
 def create_app(config_name: str = None) -> Flask:
@@ -289,9 +392,12 @@ def create_app(config_name: str = None) -> Flask:
         画像をOCI Object Storageにアップロードするエンドポイント
 
         Request:
-            - file: アップロードする画像ファイル
+            - file: アップロードする画像ファイル (ファイルアップロード)
+            - url: 画像のHTTP URL (URLからダウンロード)
             - bucket (optional): アップロード先バケット名
             - folder (optional): アップロード先フォルダ
+            
+        Note: fileとurlのどちらか一方を指定してください
 
         Returns:
             アップロード結果とアクセス用URL
@@ -302,38 +408,89 @@ def create_app(config_name: str = None) -> Flask:
                 logger.error("アップロード失敗 - OCI接続エラー")
                 return jsonify({'error': 'OCI接続エラー'}), 500
 
-            # ファイルの存在チェック
-            if 'file' not in request.files:
-                return jsonify({'error': 'ファイルが選択されていません'}), 400
+            # リクエストデータの取得（JSON または form data）
+            if request.is_json:
+                data = request.get_json()
+                bucket = data.get('bucket', settings.OCI_BUCKET)
+                folder = data.get('folder', '')
+                image_url = data.get('url')
+            else:
+                bucket = request.form.get('bucket', settings.OCI_BUCKET)
+                folder = request.form.get('folder', '')
+                image_url = request.form.get('url')
+            
+            logger.info(f"{image_url=}")
+            
+            if image_url:
+                # URLからの画像ダウンロード
+                logger.info("URL画像ダウンロード開始", url=image_url)
+                
+                # URL検証
+                if not is_valid_image_url(image_url):
+                    return jsonify({'error': '無効なURLまたは安全でないURLです'}), 400
+                
+                try:
+                    # 画像をダウンロード
+                    image_data, content_type, filename = download_image_from_url(image_url)
+                    file_size = len(image_data.getvalue())
+                    logger.info(f"{filename=}")
+                    logger.info(f"{file_size=}")
+                    
+                    # ファイル拡張子チェック
+                    if not allowed_file(filename):
+                        return jsonify({
+                            'error': f'許可されていないファイル形式です。許可形式: {", ".join(settings.ALLOWED_EXTENSIONS)}'
+                        }), 400
+                    
+                    logger.info("URL画像ダウンロード成功", 
+                               url=image_url, 
+                               size=file_size, 
+                               content_type=content_type)
+                    
+                except requests.RequestException as e:
+                    logger.error("画像ダウンロードエラー", url=image_url, error=str(e))
+                    return jsonify({'error': '画像のダウンロードに失敗しました'}), 400
+                except ValueError as e:
+                    logger.error("画像検証エラー", url=image_url, error=str(e))
+                    return jsonify({'error': str(e)}), 400
+                
+                # ユニークなオブジェクト名を生成
+                file_extension = filename.rsplit('.', 1)[1].lower()
+                unique_filename = f"{uuid.uuid4().hex}.{file_extension}"
+                
+            else:
+                # 従来のファイルアップロード
+                if 'file' not in request.files:
+                    return jsonify({'error': 'ファイルまたはURLを指定してください'}), 400
 
-            file = request.files['file']
-            if file.filename == '':
-                return jsonify({'error': 'ファイル名が空です'}), 400
+                file = request.files['file']
+                if file.filename == '':
+                    return jsonify({'error': 'ファイル名が空です'}), 400
 
-            # ファイル拡張子チェック
-            if not allowed_file(file.filename):
-                return jsonify({
-                    'error': f'許可されていないファイル形式です。許可形式: {", ".join(settings.ALLOWED_EXTENSIONS)}'
-                }), 400
+                # ファイル拡張子チェック
+                if not allowed_file(file.filename):
+                    return jsonify({
+                        'error': f'許可されていないファイル形式です。許可形式: {", ".join(settings.ALLOWED_EXTENSIONS)}'
+                    }), 400
 
-            # ファイルサイズチェック
-            file.seek(0, 2)  # ファイル末尾に移動
-            file_size = file.tell()
-            file.seek(0)  # ファイル先頭に戻る
+                # ファイルサイズチェック
+                file.seek(0, 2)  # ファイル末尾に移動
+                file_size = file.tell()
+                file.seek(0)  # ファイル先頭に戻る
 
-            if file_size > settings.MAX_CONTENT_LENGTH:
-                max_size_mb = settings.MAX_CONTENT_LENGTH // (1024*1024)
-                return jsonify({
-                    'error': f'ファイルサイズが大きすぎます。最大サイズ: {max_size_mb}MB'
-                }), 400
+                if file_size > settings.MAX_CONTENT_LENGTH:
+                    max_size_mb = settings.MAX_CONTENT_LENGTH // (1024*1024)
+                    return jsonify({
+                        'error': f'ファイルサイズが大きすぎます。最大サイズ: {max_size_mb}MB'
+                    }), 400
 
-            # アップロード先設定
-            bucket = request.form.get('bucket', settings.OCI_BUCKET)
-            folder = request.form.get('folder', '')
-
-            # ユニークなオブジェクト名を生成
-            file_extension = file.filename.rsplit('.', 1)[1].lower()
-            unique_filename = f"{uuid.uuid4().hex}.{file_extension}"
+                # ユニークなオブジェクト名を生成
+                file_extension = file.filename.rsplit('.', 1)[1].lower()
+                unique_filename = f"{uuid.uuid4().hex}.{file_extension}"
+                
+                # ファイルデータとコンテンツタイプを設定
+                image_data = file.stream
+                content_type = file.content_type or 'application/octet-stream'
 
             # フォルダが指定されている場合はパスに含める
             if folder:
@@ -344,14 +501,15 @@ def create_app(config_name: str = None) -> Flask:
             logger.info("アップロード開始",
                        bucket=bucket,
                        object=object_name,
-                       size=file_size)
+                       size=file_size,
+                       source="url" if image_url else "file")
 
             # OCI Object Storageにアップロード
             oci_client.put_object(
                 bucket_name=bucket,
                 object_name=object_name,
-                data=file.stream,
-                content_type=file.content_type or 'application/octet-stream'
+                data=image_data,
+                content_type=content_type
             )
             time.sleep(7)
 
@@ -368,11 +526,22 @@ def create_app(config_name: str = None) -> Flask:
                     'bucket': bucket,
                     'proxy_url': proxy_url,
                     'file_size': file_size,
-                    'content_type': file.content_type,
+                    'content_type': content_type,
+                    'source': 'url' if image_url else 'file',
+                    'source_url': image_url if image_url else None,
                     'uploaded_at': datetime.now().isoformat()
                 }
             })
 
+        except requests.RequestException as e:
+            logger.error("HTTP リクエストエラー", error=str(e))
+            return jsonify({'error': '画像のダウンロードに失敗しました'}), 400
+        except requests.Timeout as e:
+            logger.error("HTTP タイムアウトエラー", error=str(e))
+            return jsonify({'error': '画像のダウンロードがタイムアウトしました'}), 408
+        except ValueError as e:
+            logger.error("画像検証エラー", error=str(e))
+            return jsonify({'error': str(e)}), 400
         except ServiceError as e:
             logger.error("OCI サービスエラー", error=str(e))
             return jsonify({'error': 'アップロードに失敗しました（OCI エラー）'}), 500

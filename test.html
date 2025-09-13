@@ -100,6 +100,18 @@
     <div class="container">
         <h1>🖼️ 画像アップロードテスト</h1>
         
+        <!-- アップロード方法選択 -->
+        <div class="form-group">
+            <label>アップロード方法:</label>
+            <div style="margin: 10px 0;">
+                <input type="radio" id="uploadFile" name="uploadMethod" value="file" checked>
+                <label for="uploadFile" style="display: inline; margin-left: 5px; font-weight: normal;">ファイルアップロード</label>
+                
+                <input type="radio" id="uploadUrl" name="uploadMethod" value="url" style="margin-left: 20px;">
+                <label for="uploadUrl" style="display: inline; margin-left: 5px; font-weight: normal;">URL から画像をダウンロード</label>
+            </div>
+        </div>
+        
         <form id="uploadForm">
             <div class="form-group">
                 <label for="bucket">バケット名:</label>
@@ -111,7 +123,15 @@
                 <input type="text" id="folder" name="folder" placeholder="例: avatars, uploads">
             </div>
             
-            <div class="upload-area" id="uploadArea">
+            <!-- URL入力エリア -->
+            <div id="urlUploadArea" class="form-group" style="display: none;">
+                <label for="imageUrl">画像URL:</label>
+                <input type="url" id="imageUrl" name="imageUrl" placeholder="https://example.com/image.jpg">
+                <button type="button" id="previewUrlBtn" style="margin-top: 10px;">プレビュー</button>
+            </div>
+            
+            <!-- ファイルアップロードエリア -->
+            <div id="fileUploadArea" class="upload-area">
                 <p>📁 ここに画像ファイルをドラッグ＆ドロップするか、下のボタンでファイルを選択してください</p>
                 <input type="file" id="fileInput" accept="image/*" style="display: none;">
                 <button type="button" onclick="document.getElementById('fileInput').click()">
@@ -132,7 +152,7 @@
     </div>
 
     <script>
-        const uploadArea = document.getElementById('uploadArea');
+        const uploadArea = document.getElementById('fileUploadArea');
         const fileInput = document.getElementById('fileInput');
         const uploadForm = document.getElementById('uploadForm');
         const uploadBtn = document.getElementById('uploadBtn');
@@ -141,6 +161,67 @@
         const fileName = document.getElementById('fileName');
         const fileSize = document.getElementById('fileSize');
         const preview = document.getElementById('preview');
+        
+        // 新しい要素
+        const uploadFileRadio = document.getElementById('uploadFile');
+        const uploadUrlRadio = document.getElementById('uploadUrl');
+        const urlUploadArea = document.getElementById('urlUploadArea');
+        const fileUploadArea = document.getElementById('fileUploadArea');
+        const imageUrlInput = document.getElementById('imageUrl');
+        const previewUrlBtn = document.getElementById('previewUrlBtn');
+        
+        // アップロード方法の切り替え
+        uploadFileRadio.addEventListener('change', () => {
+            if (uploadFileRadio.checked) {
+                fileUploadArea.style.display = 'block';
+                urlUploadArea.style.display = 'none';
+                resetForm();
+            }
+        });
+        
+        uploadUrlRadio.addEventListener('change', () => {
+            if (uploadUrlRadio.checked) {
+                fileUploadArea.style.display = 'none';
+                urlUploadArea.style.display = 'block';
+                resetForm();
+            }
+        });
+        
+        // URL プレビュー機能
+        previewUrlBtn.addEventListener('click', () => {
+            const url = imageUrlInput.value.trim();
+            if (!url) {
+                showResult('URLを入力してください', 'error');
+                return;
+            }
+            
+            // URLの画像をプレビュー表示
+            preview.src = url;
+            preview.style.display = 'block';
+            preview.onload = () => {
+                fileName.textContent = url.split('/').pop() || 'URL画像';
+                fileSize.textContent = 'サイズ不明';
+                fileInfo.style.display = 'block';
+                uploadBtn.disabled = false;
+                showResult('', '');
+            };
+            preview.onerror = () => {
+                showResult('画像の読み込みに失敗しました。URLを確認してください。', 'error');
+                preview.style.display = 'none';
+                fileInfo.style.display = 'none';
+                uploadBtn.disabled = true;
+            };
+        });
+        
+        // フォームリセット機能
+        function resetForm() {
+            fileInput.value = '';
+            imageUrlInput.value = '';
+            fileInfo.style.display = 'none';
+            preview.style.display = 'none';
+            uploadBtn.disabled = true;
+            result.style.display = 'none';
+        }
 
         // ドラッグ＆ドロップ処理
         uploadArea.addEventListener('dragover', (e) => {
@@ -204,16 +285,28 @@
             e.preventDefault();
             
             const formData = new FormData();
-            const file = fileInput.files[0];
             const bucket = document.getElementById('bucket').value || 'chatbot-images';
             const folder = document.getElementById('folder').value;
+            const isUrlUpload = uploadUrlRadio.checked;
             
-            if (!file) {
-                showResult('ファイルが選択されていません', 'error');
-                return;
+            if (isUrlUpload) {
+                // URL アップロード
+                const url = imageUrlInput.value.trim();
+                if (!url) {
+                    showResult('URLを入力してください', 'error');
+                    return;
+                }
+                formData.append('url', url);
+            } else {
+                // ファイル アップロード
+                const file = fileInput.files[0];
+                if (!file) {
+                    showResult('ファイルが選択されていません', 'error');
+                    return;
+                }
+                formData.append('file', file);
             }
             
-            formData.append('file', file);
             formData.append('bucket', bucket);
             if (folder) {
                 formData.append('folder', folder);
@@ -231,12 +324,18 @@
                 const data = await response.json();
                 
                 if (response.ok && data.success) {
+                    const sourceInfo = data.data.source === 'url' ? 
+                        `<strong>元URL:</strong> ${data.data.source_url}<br>` : '';
+                    
                     showResult(`
                         <strong>✅ アップロード成功!</strong><br>
+                        <strong>アップロード方法:</strong> ${data.data.source === 'url' ? 'URL ダウンロード' : 'ファイル アップロード'}<br>
+                        ${sourceInfo}
                         <strong>オブジェクト名:</strong> ${data.data.object_name}<br>
                         <strong>バケット:</strong> ${data.data.bucket}<br>
                         <strong>プロキシURL:</strong> <a href="${data.data.proxy_url}" target="_blank">${data.data.proxy_url}</a><br>
                         <strong>ファイルサイズ:</strong> ${formatFileSize(data.data.file_size)}<br>
+                        <strong>コンテンツタイプ:</strong> ${data.data.content_type}<br>
                         <img src="${data.data.proxy_url}" style="max-width: 200px; margin-top: 10px; border-radius: 5px;">
                     `, 'success');
                 } else {
