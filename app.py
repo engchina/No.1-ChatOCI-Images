@@ -149,39 +149,67 @@ def allowed_file(filename: str) -> bool:
     return extension in settings.ALLOWED_EXTENSIONS
 
 
-def is_valid_image_url(url: str) -> bool:
-    """有効な画像URLかチェック（SSRF攻撃防止）"""
+def is_valid_image_url(url: str) -> Tuple[bool, str]:
+    """有効な画像URLかチェック（SSRF攻撃防止）
+    
+    Returns:
+        Tuple[bool, str]: (is_valid, error_message)
+    """
     try:
         parsed = urlparse(url)
+        logger.info("URL検証開始", url=url, scheme=parsed.scheme, hostname=parsed.hostname)
+        
         # HTTPSまたはHTTPのみ許可
         if parsed.scheme not in ['http', 'https']:
-            return False
+            error_msg = f"サポートされていないプロトコル: {parsed.scheme}"
+            logger.warning("URL検証失敗", url=url, reason=error_msg)
+            return False, error_msg
+            
         # ローカルIPアドレスやプライベートIPアドレスを拒否
         import ipaddress
         import socket
         
         hostname = parsed.hostname
         if not hostname:
-            return False
+            error_msg = "ホスト名が見つかりません"
+            logger.warning("URL検証失敗", url=url, reason=error_msg)
+            return False, error_msg
             
         # IPアドレスの場合はプライベートIPを拒否
         try:
             ip = ipaddress.ip_address(hostname)
+            logger.info("IP検証", ip=str(ip), is_private=ip.is_private, is_loopback=ip.is_loopback, is_link_local=ip.is_link_local)
             if ip.is_private or ip.is_loopback or ip.is_link_local:
-                return False
+                if not settings.ALLOW_PRIVATE_IPS:
+                    error_msg = f"プライベートIPアドレスは許可されていません: {ip} (ALLOW_PRIVATE_IPS=Falseのため)"
+                    logger.warning("URL検証失敗", url=url, ip=str(ip), reason=error_msg, allow_private_ips=settings.ALLOW_PRIVATE_IPS)
+                    return False, error_msg
+                else:
+                    logger.info("プライベートIP許可", ip=str(ip), url=url, allow_private_ips=settings.ALLOW_PRIVATE_IPS)
         except ValueError:
             # ホスト名の場合はDNS解決してIPをチェック
             try:
                 ip_str = socket.gethostbyname(hostname)
                 ip = ipaddress.ip_address(ip_str)
+                logger.info("DNS解決後IP検証", hostname=hostname, resolved_ip=ip_str, is_private=ip.is_private)
                 if ip.is_private or ip.is_loopback or ip.is_link_local:
-                    return False
-            except (socket.gaierror, ValueError):
-                return False
+                    if not settings.ALLOW_PRIVATE_IPS:
+                        error_msg = f"ホスト名 {hostname} がプライベートIPに解決されました: {ip} (ALLOW_PRIVATE_IPS=Falseのため)"
+                        logger.warning("URL検証失敗", url=url, hostname=hostname, resolved_ip=str(ip), reason=error_msg, allow_private_ips=settings.ALLOW_PRIVATE_IPS)
+                        return False, error_msg
+                    else:
+                        logger.info("プライベートIP許可", hostname=hostname, resolved_ip=str(ip), url=url, allow_private_ips=settings.ALLOW_PRIVATE_IPS)
+            except (socket.gaierror, ValueError) as e:
+                error_msg = f"DNS解決に失敗: {str(e)}"
+                logger.warning("URL検証失敗", url=url, hostname=hostname, reason=error_msg)
+                return False, error_msg
                 
-        return True
-    except Exception:
-        return False
+        logger.info("URL検証成功", url=url)
+        return True, ""
+    except Exception as e:
+        error_msg = f"URL検証中にエラー: {str(e)}"
+        logger.error("URL検証エラー", url=url, error=str(e))
+        return False, error_msg
 
 
 def download_image_from_url(url: str, max_size: int = None) -> Tuple[io.BytesIO, str, str]:
@@ -430,8 +458,10 @@ def create_app(config_name: str = None) -> Flask:
                 logger.info("URL画像ダウンロード開始", url=image_url)
                 
                 # URL検証
-                if not is_valid_image_url(image_url):
-                    return jsonify({'error': '無効なURLまたは安全でないURLです'}), 400
+                is_valid, error_message = is_valid_image_url(image_url)
+                if not is_valid:
+                    logger.error("URL検証失敗", url=image_url, error=error_message)
+                    return jsonify({'error': f'無効なURLまたは安全でないURLです: {error_message}'}), 400
                 
                 try:
                     # 画像をダウンロード

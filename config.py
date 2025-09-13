@@ -38,6 +38,7 @@ class Settings(BaseSettings):
         default=['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg'],
         description="許可されたファイル拡張子"
     )
+    ALLOW_PRIVATE_IPS: bool = Field(default=True, description="プライベートIPアドレスからの画像取得を許可")
 
     # セッション設定
     SESSION_COOKIE_SECURE: bool = Field(default=True, description="HTTPS必須")
