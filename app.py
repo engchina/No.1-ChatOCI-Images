@@ -396,8 +396,10 @@ def create_app(config_name: str = None) -> Flask:
             - url: 画像のHTTP URL (URLからダウンロード)
             - bucket (optional): アップロード先バケット名
             - folder (optional): アップロード先フォルダ
+            - filename (optional): カスタムファイル名（拡張子を含む）
             
         Note: fileとurlのどちらか一方を指定してください
+        Note: filenameが指定されない場合、ユニークなファイル名が自動生成されます
 
         Returns:
             アップロード結果とアクセス用URL
@@ -414,10 +416,12 @@ def create_app(config_name: str = None) -> Flask:
                 bucket = data.get('bucket', settings.OCI_BUCKET)
                 folder = data.get('folder', '')
                 image_url = data.get('url')
+                filename = data.get('filename')
             else:
                 bucket = request.form.get('bucket', settings.OCI_BUCKET)
                 folder = request.form.get('folder', '')
                 image_url = request.form.get('url')
+                filename = request.form.get('filename')
             
             logger.info(f"{image_url=}")
             
@@ -431,13 +435,13 @@ def create_app(config_name: str = None) -> Flask:
                 
                 try:
                     # 画像をダウンロード
-                    image_data, content_type, filename = download_image_from_url(image_url)
+                    image_data, content_type, downloaded_filename = download_image_from_url(image_url)
                     file_size = len(image_data.getvalue())
-                    logger.info(f"{filename=}")
+                    logger.info(f"{downloaded_filename=}")
                     logger.info(f"{file_size=}")
                     
                     # ファイル拡張子チェック
-                    if not allowed_file(filename):
+                    if not allowed_file(downloaded_filename):
                         return jsonify({
                             'error': f'許可されていないファイル形式です。許可形式: {", ".join(settings.ALLOWED_EXTENSIONS)}'
                         }), 400
@@ -455,8 +459,13 @@ def create_app(config_name: str = None) -> Flask:
                     return jsonify({'error': str(e)}), 400
                 
                 # ユニークなオブジェクト名を生成
-                file_extension = filename.rsplit('.', 1)[1].lower()
-                unique_filename = f"{uuid.uuid4().hex}.{file_extension}"
+                if filename and '.' in filename:
+                    # カスタムファイル名が指定された場合
+                    unique_filename = filename
+                else:
+                    # デフォルトのユニークファイル名を生成
+                    file_extension = downloaded_filename.rsplit('.', 1)[1].lower()
+                    unique_filename = f"{uuid.uuid4().hex}.{file_extension}"
                 
             else:
                 # 従来のファイルアップロード
@@ -486,7 +495,12 @@ def create_app(config_name: str = None) -> Flask:
 
                 # ユニークなオブジェクト名を生成
                 file_extension = file.filename.rsplit('.', 1)[1].lower()
-                unique_filename = f"{uuid.uuid4().hex}.{file_extension}"
+                if filename and '.' in filename:
+                    # カスタムファイル名が指定された場合
+                    unique_filename = filename
+                else:
+                    # デフォルトのユニークファイル名を生成
+                    unique_filename = f"{uuid.uuid4().hex}.{file_extension}"
                 
                 # ファイルデータとコンテンツタイプを設定
                 image_data = file.stream
