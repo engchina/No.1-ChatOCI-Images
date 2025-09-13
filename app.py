@@ -38,6 +38,12 @@ from oci.exceptions import ServiceError
 import sentry_sdk
 from sentry_sdk.integrations.flask import FlaskIntegration
 
+import oracledb
+import numpy as np
+from PIL import Image
+import base64
+import array
+
 from config import settings, get_config
 
 # 標準ライブラリのloggingモジュールを設定
@@ -138,6 +144,184 @@ class OCIClient:
 
 # グローバル OCI クライアント
 oci_client = OCIClient()
+
+
+class DatabaseClient:
+    """Oracle データベースクライアント"""
+    
+    def __init__(self):
+        self.connection = None
+        self._initialize()
+    
+    def _initialize(self):
+        """データベース接続を初期化"""
+        try:
+            self.connection = oracledb.connect(
+                user=settings.DB_USERNAME,
+                password=settings.DB_PASSWORD,
+                dsn=settings.DB_DSN
+            )
+            logger.info("Oracle データベース接続成功", dsn=settings.DB_DSN)
+        except Exception as e:
+            logger.error("Oracle データベース接続失敗", error=str(e))
+            self.connection = None
+    
+    def is_connected(self) -> bool:
+        """データベース接続状態をチェック"""
+        try:
+            if self.connection is None:
+                return False
+            # 簡単なクエリでテスト
+            with self.connection.cursor() as cursor:
+                cursor.execute("SELECT 1 FROM DUAL")
+                cursor.fetchone()
+            return True
+        except Exception:
+            return False
+    
+    def insert_embedding(self, bucket: str, object_name: str, content_type: str, 
+                        file_size: int, embedding: np.ndarray) -> Optional[int]:
+        """埋め込みベクトルをデータベースに挿入"""
+        try:
+            if not self.is_connected():
+                logger.error("データベース接続が無効")
+                return None
+            
+            # NumPy配列をFLOAT32配列に変換
+            embedding_array = array.array("f", embedding.tolist())
+            
+            with self.connection.cursor() as cursor:
+                # IMG_EMBEDDINGSテーブルに挿入
+                cursor.execute("""
+                    INSERT INTO IMG_EMBEDDINGS 
+                    (BUCKET, OBJECT_NAME, CONTENT_TYPE, FILE_SIZE, EMBEDDING)
+                    VALUES (:bucket, :object_name, :content_type, :file_size, :embedding)
+                    RETURNING ID INTO :id
+                """, {
+                    'bucket': bucket,
+                    'object_name': object_name,
+                    'content_type': content_type,
+                    'file_size': file_size,
+                    'embedding': embedding_array,
+                    'id': cursor.var(oracledb.NUMBER)
+                })
+                
+                # 挿入されたIDを取得
+                id_var = cursor.bindvars['id']
+                embedding_id = id_var.getvalue()
+                self.connection.commit()
+                
+                # embedding_idがリストの場合は最初の要素を取得
+                if isinstance(embedding_id, list) and len(embedding_id) > 0:
+                    embedding_id = embedding_id[0]
+                
+                logger.info("埋め込みベクトル挿入成功", 
+                           embedding_id=embedding_id, 
+                           object_name=object_name)
+                return embedding_id
+                
+        except Exception as e:
+            logger.error("埋め込みベクトル挿入失敗", error=str(e))
+            if self.connection:
+                self.connection.rollback()
+            return None
+
+
+class ImageEmbedder:
+    """Oracle Generative AI を使用した画像埋め込みクライアント"""
+    
+    def __init__(self):
+        self.client = None
+        self._initialize()
+    
+    def _initialize(self):
+        """Oracle Generative AI クライアントを初期化"""
+        try:
+            config = oci.config.from_file('/root/.oci/config', "DEFAULT")
+            self.client = oci.generative_ai_inference.GenerativeAiInferenceClient(
+                config=config,
+                service_endpoint=f"https://inference.generativeai.{settings.OCI_REGION}.oci.oraclecloud.com",
+                retry_strategy=oci.retry.NoneRetryStrategy(),
+                timeout=(10, 240)
+            )
+            logger.info("Oracle Generative AI クライアント初期化成功")
+        except Exception as e:
+            logger.error("Oracle Generative AI クライアント初期化失敗", error=str(e))
+            self.client = None
+    
+    def is_initialized(self) -> bool:
+        """クライアント初期化状態をチェック"""
+        return self.client is not None
+    
+    def _image_to_base64(self, image_data: io.BytesIO, content_type: str = "image/png") -> str:
+        """画像データをbase64 data URIエンコード"""
+        image_data.seek(0)
+        image_bytes = image_data.read()
+        base64_string = base64.b64encode(image_bytes).decode('utf-8')
+        return f"data:{content_type};base64,{base64_string}"
+    
+    def generate_embedding(self, image_data: io.BytesIO, content_type: str = "image/png") -> Optional[np.ndarray]:
+        """画像から埋め込みベクトルを生成"""
+        try:
+            if not self.is_initialized():
+                logger.error("Oracle Generative AI クライアントが初期化されていません")
+                return None
+            
+            logger.info(f"{settings.OCI_EMBEDDING_INPUT_TYPE=}")
+            logger.info(f"{settings.OCI_COMPARTMENT_OCID=}")
+
+            # 画像をbase64エンコード
+            base64_image = self._image_to_base64(image_data, content_type)
+            
+            # 埋め込みリクエストを作成
+            embed_text_detail = oci.generative_ai_inference.models.EmbedTextDetails()
+            embed_text_detail.serving_mode = oci.generative_ai_inference.models.OnDemandServingMode(
+                model_id=settings.OCI_COHERE_EMBED_MODEL
+            )
+            embed_text_detail.input_type = settings.OCI_EMBEDDING_INPUT_TYPE
+            embed_text_detail.inputs = [base64_image]
+            embed_text_detail.truncate = settings.OCI_EMBEDDING_TRUNCATE
+            embed_text_detail.compartment_id = settings.OCI_COMPARTMENT_OCID
+            
+            # リトライロジック
+            max_retries = settings.OCI_EMBEDDING_MAX_RETRIES
+            retry_count = 0
+            
+            while retry_count < max_retries:
+                try:
+                    response = self.client.embed_text(embed_text_detail)
+                    
+                    if response.data.embeddings:
+                        embedding = response.data.embeddings[0]
+                        embedding_array = np.array(embedding, dtype=np.float32)
+                        
+                        logger.info("画像埋め込みベクトル生成成功", 
+                                   embedding_shape=embedding_array.shape,
+                                   embedding_norm=float(np.linalg.norm(embedding_array)))
+                        return embedding_array
+                    else:
+                        logger.error("埋め込みベクトルが空です")
+                        return None
+                        
+                except Exception as e:
+                    retry_count += 1
+                    logger.warning(f"画像埋め込み生成エラー: {e}. リトライ中 ({retry_count}/{max_retries})...")
+                    if retry_count < max_retries:
+                        time.sleep(settings.OCI_EMBEDDING_RETRY_DELAY * retry_count)
+                    else:
+                        logger.error("画像埋め込み生成の最大リトライ回数に達しました")
+                        return None
+            
+            return None
+            
+        except Exception as e:
+            logger.error("画像埋め込み生成中に予期しないエラー", error=str(e))
+            return None
+
+
+# グローバルクライアント
+db_client = DatabaseClient()
+image_embedder = ImageEmbedder()
 
 
 def allowed_file(filename: str) -> bool:
@@ -452,6 +636,7 @@ def create_app(config_name: str = None) -> Flask:
                 filename = request.form.get('filename')
             
             logger.info(f"{image_url=}")
+            logger.info(f"{filename=}")
             
             if image_url:
                 # URLからの画像ダウンロード
@@ -593,15 +778,191 @@ def create_app(config_name: str = None) -> Flask:
             logger.error("アップロード中に予期しないエラー", error=str(e))
             return jsonify({'error': 'アップロードに失敗しました'}), 500
 
+    @app.route('/vectorize', methods=['POST'])
+    @limiter.limit("10 per minute")
+    def vectorize_image():
+        """
+        画像をベクトル化するエンドポイント
+        
+        Request:
+            - bucket: バケット名
+            - object_name: オブジェクト名
+            または
+            - file: 画像ファイル (直接アップロード)
+            - url: 画像のHTTP URL
+            
+        Returns:
+            ベクトル化結果と埋め込みベクトルID
+        """
+        try:
+            # クライアント接続チェック
+            if not image_embedder.is_initialized():
+                logger.error("ベクトル化失敗 - Oracle Generative AI接続エラー")
+                return jsonify({'error': 'Oracle Generative AI接続エラー'}), 500
+                
+            if not db_client.is_connected():
+                logger.error("ベクトル化失敗 - データベース接続エラー")
+                return jsonify({'error': 'データベース接続エラー'}), 500
+
+            # リクエストデータの取得
+            if request.is_json:
+                data = request.get_json()
+                bucket = data.get('bucket', settings.OCI_BUCKET)
+                object_name = data.get('filename')
+                image_url = data.get('url')
+            else:
+                bucket = request.form.get('bucket', settings.OCI_BUCKET)
+                object_name = request.form.get('filename')
+                image_url = request.form.get('url')
+
+            image_data = None
+            content_type = None
+            file_size = 0
+
+            if bucket and object_name:
+                # OCI Object Storageから画像を取得
+                try:
+                    if not oci_client.is_connected():
+                        return jsonify({'error': 'OCI接続エラー'}), 500
+                        
+                    response = oci_client.get_object(bucket, object_name)
+                    image_data = io.BytesIO(response.data.content)
+                    content_type = response.headers.get('Content-Type', 'image/jpeg')
+                    file_size = len(response.data.content)
+                    
+                    logger.info("OCI画像取得成功", bucket=bucket, object_name=object_name, size=file_size)
+                    
+                except ServiceError as e:
+                    if e.status == 404:
+                        return jsonify({'error': '指定された画像が見つかりません'}), 404
+                    else:
+                        logger.error("OCI画像取得エラー", error=str(e))
+                        return jsonify({'error': 'OCI画像取得エラー'}), 500
+                        
+            elif image_url:
+                # URLから画像をダウンロード
+                try:
+                    # URL検証
+                    is_valid, error_message = is_valid_image_url(image_url)
+                    if not is_valid:
+                        return jsonify({'error': f'無効なURL: {error_message}'}), 400
+                    
+                    image_data, content_type, filename = download_image_from_url(image_url)
+                    file_size = len(image_data.getvalue())
+                    
+                    # ファイル拡張子チェック
+                    if not allowed_file(filename):
+                        return jsonify({
+                            'error': f'許可されていないファイル形式です。許可形式: {", ".join(settings.ALLOWED_EXTENSIONS)}'
+                        }), 400
+                    
+                    # オブジェクト名を設定（filenameがある場合はそれを使用、なければ一時的な名前を生成）
+                    if filename:
+                        object_name = filename
+                    else:
+                        file_extension = filename.rsplit('.', 1)[1].lower() if filename else 'jpg'
+                        object_name = f"temp_{uuid.uuid4().hex}.{file_extension}"
+                    
+                    logger.info("URL画像取得成功", url=image_url, size=file_size)
+                    
+                except Exception as e:
+                    logger.error("URL画像取得エラー", url=image_url, error=str(e))
+                    return jsonify({'error': '画像の取得に失敗しました'}), 400
+                    
+            elif 'file' in request.files:
+                # 直接ファイルアップロード
+                file = request.files['file']
+                if file.filename == '':
+                    return jsonify({'error': 'ファイル名が空です'}), 400
+                
+                # ファイル拡張子チェック
+                if not allowed_file(file.filename):
+                    return jsonify({
+                        'error': f'許可されていないファイル形式です。許可形式: {", ".join(settings.ALLOWED_EXTENSIONS)}'
+                    }), 400
+                
+                # ファイルサイズチェック
+                file.seek(0, 2)
+                file_size = file.tell()
+                file.seek(0)
+                
+                if file_size > settings.MAX_CONTENT_LENGTH:
+                    max_size_mb = settings.MAX_CONTENT_LENGTH // (1024*1024)
+                    return jsonify({
+                        'error': f'ファイルサイズが大きすぎます。最大サイズ: {max_size_mb}MB'
+                    }), 400
+                
+                image_data = io.BytesIO(file.read())
+                content_type = file.content_type or 'application/octet-stream'
+                
+                # オブジェクト名を設定（filenameがある場合はそれを使用、なければ一時的な名前を生成）
+                if file.filename:
+                    object_name = file.filename
+                else:
+                    file_extension = file.filename.rsplit('.', 1)[1].lower() if file.filename else 'jpg'
+                    object_name = f"temp_{uuid.uuid4().hex}.{file_extension}"
+                
+                logger.info("ファイル画像取得成功", filename=file.filename, size=file_size)
+                
+            else:
+                return jsonify({'error': 'bucket/object_name、url、またはfileのいずれかを指定してください'}), 400
+
+            # ベクトル化実行
+            logger.info("画像ベクトル化開始", bucket=bucket, object_name=object_name)
+            
+            embedding = image_embedder.generate_embedding(image_data, content_type)
+            if embedding is None:
+                logger.error("画像ベクトル化失敗", object_name=object_name)
+                return jsonify({'error': '画像のベクトル化に失敗しました'}), 500
+            
+            # データベースに保存
+            embedding_id = db_client.insert_embedding(
+                bucket=bucket,
+                object_name=object_name,
+                content_type=content_type,
+                file_size=file_size,
+                embedding=embedding
+            )
+            
+            if embedding_id is None:
+                logger.error("埋め込みベクトル保存失敗", object_name=object_name)
+                return jsonify({'error': '埋め込みベクトルの保存に失敗しました'}), 500
+            
+            logger.info("画像ベクトル化成功", embedding_id=embedding_id, object_name=object_name)
+            
+            return jsonify({
+                'success': True,
+                'message': '画像のベクトル化が完了しました',
+                'data': {
+                    'embedding_id': embedding_id,
+                    'bucket': bucket,
+                    'object_name': object_name,
+                    'file_size': file_size,
+                    'content_type': content_type,
+                    'embedding_shape': embedding.shape,
+                    'embedding_norm': float(np.linalg.norm(embedding)),
+                    'vectorized_at': datetime.now().isoformat()
+                }
+            })
+            
+        except Exception as e:
+            logger.error("ベクトル化処理中に予期しないエラー", error=str(e))
+            return jsonify({'error': 'ベクトル化処理に失敗しました'}), 500
+
     @app.route('/health')
     def health_check():
         """ヘルスチェック用エンドポイント"""
         is_connected = oci_client.is_connected()
+        db_connected = db_client.is_connected()
+        embedder_initialized = image_embedder.is_initialized()
+        
         return jsonify({
-            'status': 'healthy' if is_connected else 'unhealthy',
+            'status': 'healthy' if (is_connected and db_connected and embedder_initialized) else 'unhealthy',
             'oci_connection': 'OK' if is_connected else 'OCI接続が初期化されていません',
+            'database_connection': 'OK' if db_connected else 'データベース接続エラー',
+            'embedder_status': 'OK' if embedder_initialized else 'Oracle Generative AI接続エラー',
             'timestamp': datetime.now().isoformat()
-        }), 200 if is_connected else 503
+        }), 200 if (is_connected and db_connected and embedder_initialized) else 503
 
     # エラーハンドラー
     @app.errorhandler(413)

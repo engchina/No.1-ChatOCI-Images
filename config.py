@@ -31,6 +31,21 @@ class Settings(BaseSettings):
     OCI_PROFILE: str = Field(default="DEFAULT", description="OCI設定プロファイル")
     OCI_BUCKET: str = Field(default="chatbot-images", description="デフォルトバケット名")
     OCI_REGION: Optional[str] = Field(default=None, description="OCI リージョン")
+    OCI_COMPARTMENT_OCID: Optional[str] = Field(default=None, description="OCI コンパートメントOCID")
+
+    # Oracle データベース設定
+    DB_USERNAME: str = Field(default="ADMIN", description="データベースユーザー名")
+    DB_PASSWORD: str = Field(default="", description="データベースパスワード")
+    DB_DSN: str = Field(default="localhost:1521/XEPDB1", description="データベース接続文字列（DSN）")
+
+    # Oracle Generative AI設定
+    OCI_COHERE_EMBED_MODEL: str = Field(default="cohere.embed-v4.0", description="Oracle Generative AI埋め込みモデル")
+    OCI_EMBEDDING_DIMENSION: int = Field(default=1536, description="埋め込みベクトル次元数")
+    OCI_EMBEDDING_INPUT_TYPE: str = Field(default="IMAGE", description="埋め込み入力タイプ")
+    OCI_EMBEDDING_TRUNCATE: str = Field(default="NONE", description="切り詰め戦略")
+    OCI_EMBEDDING_BATCH_SIZE: int = Field(default=1, description="バッチ処理サイズ")
+    OCI_EMBEDDING_MAX_RETRIES: int = Field(default=3, description="最大リトライ回数")
+    OCI_EMBEDDING_RETRY_DELAY: int = Field(default=10, description="リトライ遅延（秒）")
 
     # セキュリティ設定
     MAX_CONTENT_LENGTH: int = Field(default=16 * 1024 * 1024, description="最大アップロードサイズ (16MB)")
