@@ -16,9 +16,8 @@ OCIオブジェクトストレージの画像を認証付きで表示・アッ�
 import os
 import uuid
 import structlog
-from datetime import datetime, timedelta
-from typing import Optional, Tuple, Dict, Any
-from pathlib import Path
+from datetime import datetime
+from typing import Optional, Tuple
 import time
 import io
 import requests
@@ -224,6 +223,95 @@ class DatabaseClient:
             logger.error("埋め込みベクトル挿入失敗", error=str(e))
             if self.connection:
                 self.connection.rollback()
+            return None
+    
+    def search_similar_images(self, query: str, limit: int = 10, threshold: float = 0.7) -> Optional[list]:
+        """クエリテキストに基づいて類似画像を検索
+        
+        Args:
+            query: 検索クエリテキスト
+            limit: 返す結果の最大数
+            threshold: 類似度の閾値（0.0-1.0）
+            
+        Returns:
+            類似画像のリスト（bucket, object_name, vector_distance）
+        """
+        try:
+            if not self.is_connected():
+                logger.error("データベース接続が無効")
+                return None
+            
+            with self.connection.cursor() as cursor:
+                # ベクトル類似度検索クエリを実行
+                sql = """
+                SELECT 
+                    ie.ID as embed_id, 
+                    ie.BUCKET as bucket,
+                    ie.OBJECT_NAME as object_name,
+                    VECTOR_DISTANCE(ie.EMBEDDING, (
+                        SELECT  
+                            TO_VECTOR(et.embed_vector) embed_vector 
+                        FROM 
+                            DBMS_VECTOR_CHAIN.UTL_TO_EMBEDDINGS( 
+                                :query, 
+                                JSON('{"provider": "ocigenai", "credential_name": "OCI_CRED", "url": "https://inference.generativeai.ap-osaka-1.oci.oraclecloud.com/20231130/actions/embedText", "model": "cohere.embed-v4.0"}')) t, 
+                                JSON_TABLE(t.column_value, '$[*]' 
+                                COLUMNS( 
+                                    embed_id NUMBER PATH '$.embed_id', 
+                                    embed_data VARCHAR2(4000) PATH '$.embed_data', 
+                                    embed_vector CLOB PATH '$.embed_vector' 
+                                ) 
+                            ) 
+                        et), COSINE 
+                    ) vector_distance 
+                FROM  
+                    IMG_EMBEDDINGS ie 
+                WHERE  
+                    1 = 1 
+                    AND VECTOR_DISTANCE(ie.EMBEDDING, ( 
+                        SELECT  
+                            TO_VECTOR(et.embed_vector) embed_vector 
+                        FROM 
+                            DBMS_VECTOR_CHAIN.UTL_TO_EMBEDDINGS( 
+                                :query, 
+                                JSON('{"provider": "ocigenai", "credential_name": "OCI_CRED", "url": "https://inference.generativeai.ap-osaka-1.oci.oraclecloud.com/20231130/actions/embedText", "model": "cohere.embed-v4.0"}')) t, 
+                                JSON_TABLE(t.column_value, '$[*]' 
+                                COLUMNS( 
+                                    embed_id NUMBER PATH '$.embed_id', 
+                                    embed_data VARCHAR2(4000) PATH '$.embed_data', 
+                                    embed_vector CLOB PATH '$.embed_vector' 
+                                ) 
+                            ) 
+                        et), COSINE 
+                    ) <= :threshold 
+                ORDER BY  
+                    vector_distance
+                FETCH FIRST :limit ROWS ONLY
+                """
+                
+                cursor.execute(sql, {
+                    'query': query,
+                    'threshold': threshold,
+                    'limit': limit
+                })
+                
+                results = []
+                for row in cursor:
+                    results.append({
+                        'embed_id': row[0],
+                        'bucket': row[1],
+                        'object_name': row[2],
+                        'vector_distance': float(row[3])
+                    })
+                
+                logger.info("ベクトル検索成功", 
+                           query=query, 
+                           results_count=len(results),
+                           threshold=threshold)
+                return results
+                
+        except Exception as e:
+            logger.error("ベクトル検索失敗", query=query, error=str(e))
             return None
 
 
@@ -948,6 +1036,91 @@ def create_app(config_name: str = None) -> Flask:
         except Exception as e:
             logger.error("ベクトル化処理中に予期しないエラー", error=str(e))
             return jsonify({'error': 'ベクトル化処理に失敗しました'}), 500
+
+    @app.route('/search', methods=['POST'])
+    @limiter.limit("20 per minute")
+    def search_similar_images():
+        """
+        テキストクエリに基づいて類似画像を検索するエンドポイント
+        
+        Request:
+            - query: 検索クエリテキスト (必須)
+            - limit: 返す結果の最大数 (オプション、デフォルト: 10)
+            - threshold: 類似度の閾値 (オプション、デフォルト: 0.7)
+            
+        Returns:
+            類似画像のリスト（bucket, object_name, vector_distance）
+        """
+        try:
+            # データベース接続チェック
+            if not db_client.is_connected():
+                logger.error("検索失敗 - データベース接続エラー")
+                return jsonify({'error': 'データベース接続エラー'}), 500
+            
+            # リクエストデータの取得
+            if request.is_json:
+                data = request.get_json()
+                if not data:
+                    return jsonify({'error': 'JSONデータが必要です'}), 400
+                query = data.get('query')
+                limit = data.get('limit', 10)
+                threshold = data.get('threshold', 0.7)
+            else:
+                query = request.form.get('query')
+                limit = int(request.form.get('limit', 10))
+                threshold = float(request.form.get('threshold', 0.7))
+            
+            # クエリパラメータの検証
+            if not query or not query.strip():
+                return jsonify({'error': 'クエリテキストが必要です'}), 400
+            
+            if not isinstance(limit, int) or limit <= 0 or limit > 100:
+                return jsonify({'error': 'limitは1から100の間の整数である必要があります'}), 400
+            
+            if not isinstance(threshold, (int, float)) or threshold < 0 or threshold > 1:
+                return jsonify({'error': 'thresholdは0.0から1.0の間の数値である必要があります'}), 400
+            
+            logger.info("画像検索開始", query=query, limit=limit, threshold=threshold)
+            
+            # 類似画像検索を実行
+            results = db_client.search_similar_images(
+                query=query.strip(),
+                limit=limit,
+                threshold=threshold
+            )
+            
+            if results is None:
+                logger.error("画像検索失敗", query=query)
+                return jsonify({'error': '画像検索に失敗しました'}), 500
+            
+            # プロキシURLを追加
+            for result in results:
+                result['proxy_url'] = f"/img/{result['bucket']}/{result['object_name']}"
+            
+            logger.info("画像検索成功", 
+                       query=query, 
+                       results_count=len(results),
+                       threshold=threshold)
+            
+            return jsonify({
+                'success': True,
+                'message': f'検索が完了しました。{len(results)}件の類似画像が見つかりました。',
+                'data': {
+                    'query': query,
+                    'limit': limit,
+                    'threshold': threshold,
+                    'results_count': len(results),
+                    'results': results,
+                    'searched_at': datetime.now().isoformat()
+                }
+            })
+            
+        except ValueError as e:
+            logger.error("パラメータエラー", query=query, error=str(e))
+            return jsonify({'error': f'パラメータエラー: {str(e)}'}), 400
+        except Exception as e:
+            logger.error("検索処理中に予期しないエラー", query=query, error=str(e))
+            return jsonify({'error': '検索処理に失敗しました'}), 500
 
     @app.route('/health')
     def health_check():
