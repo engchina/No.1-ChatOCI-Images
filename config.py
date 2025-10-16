@@ -50,7 +50,7 @@ class Settings(BaseSettings):
     # セキュリティ設定
     MAX_CONTENT_LENGTH: int = Field(default=16 * 1024 * 1024, description="最大アップロードサイズ (16MB)")
     ALLOWED_EXTENSIONS: List[str] = Field(
-        default=['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg'],
+        default=['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg', 'ppt', 'pptx'],
         description="許可されたファイル拡張子"
     )
     ALLOW_PRIVATE_IPS: bool = Field(default=True, description="プライベートIPアドレスからの画像取得を許可")

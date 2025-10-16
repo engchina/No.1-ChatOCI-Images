@@ -421,6 +421,30 @@ def allowed_file(filename: str) -> bool:
     return extension in settings.ALLOWED_EXTENSIONS
 
 
+def create_response(success: bool, message: str, data: Optional[dict] = None, status_code: int = 200) -> Tuple[dict, int]:
+    """統一されたAPIレスポンス形式を作成
+    
+    Args:
+        success: 処理の成功/失敗
+        message: レスポンスメッセージ
+        data: 追加データ（オプション）
+        status_code: HTTPステータスコード
+        
+    Returns:
+        Tuple[dict, int]: (レスポンスデータ, ステータスコード)
+    """
+    response = {
+        'success': success,
+        'message': message,
+        'timestamp': datetime.now().isoformat()
+    }
+    
+    if data is not None:
+        response['data'] = data
+        
+    return response, status_code
+
+
 def is_valid_image_url(url: str) -> Tuple[bool, str]:
     """有効な画像URLかチェック（SSRF攻撃防止）
     
@@ -1121,6 +1145,172 @@ def create_app(config_name: str = None) -> Flask:
         except Exception as e:
             logger.error("検索処理中に予期しないエラー", query=query, error=str(e))
             return jsonify({'error': '検索処理に失敗しました'}), 500
+
+    @app.route('/api/upload/ppt', methods=['POST'])
+    @limiter.limit(settings.RATELIMIT_UPLOAD)
+    def upload_ppt():
+        """
+        PPT/PPTXファイルをOCI Object Storageにアップロードするエンドポイント
+        
+        Request:
+            - file: アップロードするPPT/PPTXファイル (必須)
+            - bucket (optional): アップロード先バケット名
+            - folder (optional): アップロード先フォルダ
+            - filename (optional): カスタムファイル名（拡張子を含む）
+            
+        Returns:
+            アップロード結果とアクセス用URL
+        """
+        logger.info("PPT/PPTXファイルアップロードリクエストを受信しました")
+        
+        try:
+            # OCI接続チェック
+            if not oci_client.is_connected():
+                logger.error("アップロード失敗 - OCI接続エラー")
+                response, status_code = create_response(
+                    success=False,
+                    message='OCI接続エラー',
+                    status_code=500
+                )
+                return jsonify(response), status_code
+            
+            # ファイルがリクエストに含まれているかチェック
+            if 'file' not in request.files:
+                logger.warning("ファイルがリクエストに含まれていません")
+                response, status_code = create_response(
+                    success=False,
+                    message='ファイルが指定されていません',
+                    status_code=400
+                )
+                return jsonify(response), status_code
+            
+            file = request.files['file']
+            
+            # ファイルが選択されているかチェック
+            if file.filename == '':
+                logger.warning("ファイルが選択されていません")
+                response, status_code = create_response(
+                    success=False,
+                    message='ファイルが選択されていません',
+                    status_code=400
+                )
+                return jsonify(response), status_code
+            
+            # ファイル拡張子をチェック
+            if not allowed_file(file.filename):
+                logger.warning(f"サポートされていないファイル形式: {file.filename}")
+                response, status_code = create_response(
+                    success=False,
+                    message=f'サポートされていないファイル形式です。許可される形式: {", ".join(settings.ALLOWED_EXTENSIONS)}',
+                    status_code=400
+                )
+                return jsonify(response), status_code
+            
+            # PPT/PPTX専用チェック
+            file_extension = file.filename.rsplit('.', 1)[1].lower() if '.' in file.filename else ''
+            if file_extension not in ['ppt', 'pptx']:
+                logger.warning(f"PPT/PPTX以外のファイル形式: {file.filename}")
+                response, status_code = create_response(
+                    success=False,
+                    message='PPT/PPTXファイルのみアップロード可能です',
+                    status_code=400
+                )
+                return jsonify(response), status_code
+            
+            # ファイルサイズチェック
+            file.seek(0, 2)  # ファイル末尾に移動
+            file_size = file.tell()
+            file.seek(0)  # ファイル先頭に戻る
+            
+            if file_size > settings.MAX_CONTENT_LENGTH:
+                max_size_mb = settings.MAX_CONTENT_LENGTH // (1024*1024)
+                logger.warning(f"ファイルサイズが大きすぎます: {file_size} bytes")
+                response, status_code = create_response(
+                    success=False,
+                    message=f'ファイルサイズが大きすぎます。最大サイズ: {max_size_mb}MB',
+                    status_code=400
+                )
+                return jsonify(response), status_code
+            
+            # リクエストパラメータの取得
+            bucket = request.form.get('bucket', settings.OCI_BUCKET)
+            folder = request.form.get('folder', '')
+            custom_filename = request.form.get('filename')
+            
+            # ユニークなオブジェクト名を生成
+            if custom_filename and '.' in custom_filename:
+                # カスタムファイル名が指定された場合
+                unique_filename = custom_filename
+            else:
+                # デフォルトのユニークファイル名を生成
+                unique_filename = f"{uuid.uuid4().hex}.{file_extension}"
+            
+            # フォルダが指定されている場合はパスに含める
+            if folder:
+                object_name = f"{folder.strip('/')}/{unique_filename}"
+            else:
+                object_name = unique_filename
+            
+            # ファイルデータとコンテンツタイプを設定
+            file_data = file.stream
+            content_type = file.content_type or 'application/vnd.ms-powerpoint'
+            
+            # PPTXの場合はより適切なMIMEタイプを設定
+            if file_extension == 'pptx':
+                content_type = 'application/vnd.openxmlformats-officedocument.presentationml.presentation'
+            elif file_extension == 'ppt':
+                content_type = 'application/vnd.ms-powerpoint'
+            
+            logger.info("PPT/PPTXアップロード開始",
+                       bucket=bucket,
+                       object=object_name,
+                       size=file_size,
+                       content_type=content_type)
+            
+            # OCI Object Storageにアップロード
+            oci_client.put_object(
+                bucket_name=bucket,
+                object_name=object_name,
+                data=file_data,
+                content_type=content_type
+            )
+            
+            # プロキシURL生成
+            proxy_url = f"/img/{bucket}/{object_name}"
+            
+            logger.info("PPT/PPTXアップロード成功", object=object_name)
+            
+            response, status_code = create_response(
+                success=True,
+                message='PPT/PPTXファイルのアップロードが完了しました',
+                data={
+                    'object_name': object_name,
+                    'bucket': bucket,
+                    'proxy_url': proxy_url,
+                    'file_size': file_size,
+                    'content_type': content_type,
+                    'file_extension': file_extension,
+                    'uploaded_at': datetime.now().isoformat()
+                }
+            )
+            return jsonify(response), status_code
+            
+        except ServiceError as e:
+            logger.error("OCI サービスエラー", error=str(e))
+            response, status_code = create_response(
+                success=False,
+                message='アップロードに失敗しました（OCI エラー）',
+                status_code=500
+            )
+            return jsonify(response), status_code
+        except Exception as e:
+            logger.error("PPT/PPTXアップロード中に予期しないエラー", error=str(e))
+            response, status_code = create_response(
+                success=False,
+                message='アップロードに失敗しました',
+                status_code=500
+            )
+            return jsonify(response), status_code
 
     @app.route('/health')
     def health_check():
