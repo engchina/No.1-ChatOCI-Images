@@ -415,10 +415,16 @@ image_embedder = ImageEmbedder()
 def allowed_file(filename: str) -> bool:
     """許可されたファイル拡張子かチェック"""
     if not filename or '.' not in filename:
+        logger.debug(f"ファイル名が無効: {filename}")
         return False
 
     extension = filename.rsplit('.', 1)[1].lower()
-    return extension in settings.ALLOWED_EXTENSIONS
+    allowed = extension in settings.ALLOWED_EXTENSIONS
+    
+    # デバッグ情報を追加
+    logger.debug(f"ファイル拡張子チェック: filename={filename}, extension={extension}, allowed_extensions={settings.ALLOWED_EXTENSIONS}, result={allowed}")
+    
+    return allowed
 
 
 def create_response(success: bool, message: str, data: Optional[dict] = None, status_code: int = 200) -> Tuple[dict, int]:
@@ -586,6 +592,11 @@ def create_app(config_name: str = None) -> Flask:
         SESSION_COOKIE_SAMESITE=settings.SESSION_COOKIE_SAMESITE,
         PERMANENT_SESSION_LIFETIME=settings.PERMANENT_SESSION_LIFETIME,
     )
+    
+    # 記録当前配置以便調試
+    logger.info(f"应用启动 - 允许的文件扩展名: {settings.ALLOWED_EXTENSIONS}")
+    logger.info(f"应用启动 - 最大文件大小: {settings.MAX_CONTENT_LENGTH} bytes")
+    logger.info(f"应用启动 - 日志级别: {settings.LOG_LEVEL}")
 
     # Sentry初期化（エラー監視）
     if settings.SENTRY_DSN and settings.SENTRY_DSN.strip():

@@ -92,7 +92,19 @@ class Settings(BaseSettings):
     @classmethod
     def validate_extensions(cls, v):
         """ファイル拡張子の検証"""
-        return [ext.lower().strip('.') for ext in v]
+        # 確保所有扩展名都是小写且不包含点号
+        validated = []
+        for ext in v:
+            clean_ext = ext.lower().strip().strip('.')
+            if clean_ext:  # 確保不是空字符串
+                validated.append(clean_ext)
+        
+        # 添加日志记录以便调试
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.debug(f"验证后的允许扩展名: {validated}")
+        
+        return validated
 
     @field_validator('LOG_LEVEL')
     @classmethod
