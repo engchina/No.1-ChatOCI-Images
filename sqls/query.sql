@@ -8,7 +8,7 @@ SELECT
         FROM 
             DBMS_VECTOR_CHAIN.UTL_TO_EMBEDDINGS( 
                 'hello world', 
-                JSON('{"provider": "ocigenai", "credential_name": "OCI_CRED", "url": "https://inference.generativeai.ap-osaka-1.oci.oraclecloud.com/20231130/actions/embedText", "model": "cohere.embed-v4.0"}')) t, 
+                JSON('{"provider": "ocigenai", "credential_name": "OCI_CRED", "url": "https://inference.generativeai.us-chicago-1.oci.oraclecloud.com/20231130/actions/embedText", "model": "cohere.embed-v4.0"}')) t, 
                 JSON_TABLE(t.column_value, '$[*]' 
                 COLUMNS( 
                     embed_id NUMBER PATH '$.embed_id', 
@@ -28,7 +28,7 @@ WHERE
         FROM 
             DBMS_VECTOR_CHAIN.UTL_TO_EMBEDDINGS( 
                 'hello world', 
-                JSON('{"provider": "ocigenai", "credential_name": "OCI_CRED", "url": "https://inference.generativeai.ap-osaka-1.oci.oraclecloud.com/20231130/actions/embedText", "model": "cohere.embed-v4.0"}')) t, 
+                JSON('{"provider": "ocigenai", "credential_name": "OCI_CRED", "url": "https://inference.generativeai.us-chicago-1.oci.oraclecloud.com/20231130/actions/embedText", "model": "cohere.embed-v4.0"}')) t, 
                 JSON_TABLE(t.column_value, '$[*]' 
                 COLUMNS( 
                     embed_id NUMBER PATH '$.embed_id', 
@@ -52,7 +52,7 @@ SELECT
         FROM 
             DBMS_VECTOR_CHAIN.UTL_TO_EMBEDDINGS( 
                 'hello world', 
-                JSON('{"provider": "ocigenai", "credential_name": "OCI_CRED", "url": "https://inference.generativeai.ap-osaka-1.oci.oraclecloud.com/20231130/actions/embedText", "model": "cohere.embed-v4.0"}')) t, 
+                JSON('{"provider": "ocigenai", "credential_name": "OCI_CRED", "url": "https://inference.generativeai.us-chicago-1.oci.oraclecloud.com/20231130/actions/embedText", "model": "cohere.embed-v4.0"}')) t, 
                 JSON_TABLE(t.column_value, '$[*]' 
                 COLUMNS( 
                     embed_id NUMBER PATH '$.embed_id', 
