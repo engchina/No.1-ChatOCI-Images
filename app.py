@@ -167,6 +167,35 @@ class DatabaseClient:
             logger.error("Oracle database connection failed", error=str(e))
             self.connection = None
     
+    def _reconnect_with_retry(self) -> bool:
+        """Attempt to reconnect to database with retry logic
+        
+        Returns:
+            bool: True if reconnection successful, False otherwise
+        """
+        max_retries = settings.OCI_EMBEDDING_MAX_RETRIES
+        retry_delay = settings.OCI_EMBEDDING_RETRY_DELAY
+        
+        for retry in range(max_retries):
+            try:
+                logger.info(f"Database reconnection attempt {retry + 1}/{max_retries}")
+                self._initialize()
+                
+                if self.is_connected():
+                    logger.info(f"Database reconnection successful after {retry + 1} attempts")
+                    return True
+                    
+                if retry < max_retries - 1:
+                    time.sleep(retry_delay)
+                    
+            except Exception as e:
+                logger.warning(f"Database reconnection attempt {retry + 1} failed", error=str(e))
+                if retry < max_retries - 1:
+                    time.sleep(retry_delay)
+        
+        logger.error(f"Database reconnection failed after {max_retries} attempts")
+        return False
+    
     def is_connected(self) -> bool:
         """Check database connection status"""
         try:
@@ -262,9 +291,12 @@ class DatabaseClient:
                         file_size: int, embedding: np.ndarray) -> Optional[int]:
         """Insert embedding vector into database"""
         try:
+            # Check connection and retry if needed
             if not self.is_connected():
-                logger.error("Database connection is invalid")
-                return None
+                logger.warning("Database connection is invalid, attempting to reconnect")
+                if not self._reconnect_with_retry():
+                    logger.error("Database connection failed after retry attempts")
+                    return None
             
             # Ensure table exists before inserting
             if not self._table_exists():
@@ -324,9 +356,12 @@ class DatabaseClient:
             List of similar images (bucket, object_name, vector_distance)
         """
         try:
+            # Check connection and retry if needed
             if not self.is_connected():
-                logger.error("Database connection is invalid")
-                return None
+                logger.warning("Database connection is invalid, attempting to reconnect")
+                if not self._reconnect_with_retry():
+                    logger.error("Database connection failed after retry attempts")
+                    return None
             
             # Ensure table exists before searching
             if not self._table_exists():
@@ -1070,9 +1105,12 @@ def create_app(config_name: str = None) -> Flask:
                 logger.error("Vectorization failed - Oracle Generative AI connection error")
                 return jsonify({'error': 'Oracle Generative AI connection error'}), 500
                 
+            # Check database connection and retry if needed
             if not db_client.is_connected():
-                logger.error("Vectorization failed - Database connection error")
-                return jsonify({'error': 'Database connection error'}), 500
+                logger.warning("Database connection check failed in /vectorize endpoint, attempting to reconnect")
+                if not db_client._reconnect_with_retry():
+                    logger.error("Vectorization failed - Database connection error after retry attempts")
+                    return jsonify({'error': 'Database connection error'}), 500
             
             # Ensure IMG_EMBEDDINGS table exists
             if not db_client._table_exists():
@@ -1241,10 +1279,12 @@ def create_app(config_name: str = None) -> Flask:
             List of similar images (bucket, object_name, vector_distance)
         """
         try:
-            # Check database connection
+            # Check database connection and retry if needed
             if not db_client.is_connected():
-                logger.error("Search failed - Database connection error")
-                return jsonify({'error': 'Database connection error'}), 500
+                logger.warning("Database connection check failed in /search endpoint, attempting to reconnect")
+                if not db_client._reconnect_with_retry():
+                    logger.error("Search failed - Database connection error after retry attempts")
+                    return jsonify({'error': 'Database connection error'}), 500
             
             # Get request data
             if request.is_json:
