@@ -325,7 +325,7 @@ class ImageEmbedder:
     def _initialize(self):
         """Oracle Generative AI クライアントを初期化"""
         try:
-            config = oci.config.from_file('/root/.oci/config', "DEFAULT")
+            config = oci.config.from_file('~/.oci/config', "DEFAULT")
             self.client = oci.generative_ai_inference.GenerativeAiInferenceClient(
                 config=config,
                 service_endpoint=f"https://inference.generativeai.{settings.OCI_REGION}.oci.oraclecloud.com",
