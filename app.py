@@ -225,11 +225,11 @@ class DatabaseClient:
                 self.connection.rollback()
             return None
     
-    def search_similar_images(self, query: str, limit: int = 10, threshold: float = 0.7) -> Optional[list]:
-        """クエリテキストに基づいて類似画像を検索
+    def search_similar_images(self, query_embedding: np.ndarray, limit: int = 10, threshold: float = 0.7) -> Optional[list]:
+        """埋め込みベクトルに基づいて類似画像を検索
         
         Args:
-            query: 検索クエリテキスト
+            query_embedding: 検索用の埋め込みベクトル
             limit: 返す結果の最大数
             threshold: 類似度の閾値（0.0-1.0）
             
@@ -241,6 +241,9 @@ class DatabaseClient:
                 logger.error("データベース接続が無効")
                 return None
             
+            # NumPy配列をFLOAT32配列に変換
+            embedding_array = array.array("f", query_embedding.tolist())
+            
             with self.connection.cursor() as cursor:
                 # ベクトル類似度検索クエリを実行
                 sql = """
@@ -248,49 +251,18 @@ class DatabaseClient:
                     ie.ID as embed_id, 
                     ie.BUCKET as bucket,
                     ie.OBJECT_NAME as object_name,
-                    VECTOR_DISTANCE(ie.EMBEDDING, (
-                        SELECT  
-                            TO_VECTOR(et.embed_vector) embed_vector 
-                        FROM 
-                            DBMS_VECTOR_CHAIN.UTL_TO_EMBEDDINGS( 
-                                :query, 
-                                JSON('{"provider": "ocigenai", "credential_name": "OCI_CRED", "url": "https://inference.generativeai.us-chicago-1.oci.oraclecloud.com/20231130/actions/embedText", "model": "cohere.embed-v4.0"}')) t, 
-                                JSON_TABLE(t.column_value, '$[*]' 
-                                COLUMNS( 
-                                    embed_id NUMBER PATH '$.embed_id', 
-                                    embed_data VARCHAR2(4000) PATH '$.embed_data', 
-                                    embed_vector CLOB PATH '$.embed_vector' 
-                                ) 
-                            ) 
-                        et), COSINE 
-                    ) vector_distance 
+                    VECTOR_DISTANCE(ie.EMBEDDING, :query_embedding, COSINE) as vector_distance 
                 FROM  
                     IMG_EMBEDDINGS ie 
                 WHERE  
-                    1 = 1 
-                    AND VECTOR_DISTANCE(ie.EMBEDDING, ( 
-                        SELECT  
-                            TO_VECTOR(et.embed_vector) embed_vector 
-                        FROM 
-                            DBMS_VECTOR_CHAIN.UTL_TO_EMBEDDINGS( 
-                                :query, 
-                                JSON('{"provider": "ocigenai", "credential_name": "OCI_CRED", "url": "https://inference.generativeai.us-chicago-1.oci.oraclecloud.com/20231130/actions/embedText", "model": "cohere.embed-v4.0"}')) t, 
-                                JSON_TABLE(t.column_value, '$[*]' 
-                                COLUMNS( 
-                                    embed_id NUMBER PATH '$.embed_id', 
-                                    embed_data VARCHAR2(4000) PATH '$.embed_data', 
-                                    embed_vector CLOB PATH '$.embed_vector' 
-                                ) 
-                            ) 
-                        et), COSINE 
-                    ) <= :threshold 
+                    VECTOR_DISTANCE(ie.EMBEDDING, :query_embedding, COSINE) <= :threshold 
                 ORDER BY  
                     vector_distance
                 FETCH FIRST :limit ROWS ONLY
                 """
                 
                 cursor.execute(sql, {
-                    'query': query,
+                    'query_embedding': embedding_array,
                     'threshold': threshold,
                     'limit': limit
                 })
@@ -305,13 +277,12 @@ class DatabaseClient:
                     })
                 
                 logger.info("ベクトル検索成功", 
-                           query=query, 
                            results_count=len(results),
                            threshold=threshold)
                 return results
                 
         except Exception as e:
-            logger.error("ベクトル検索失敗", query=query, error=str(e))
+            logger.error("ベクトル検索失敗", error=str(e))
             return None
 
 
@@ -407,9 +378,91 @@ class ImageEmbedder:
             return None
 
 
+class TextEmbedder:
+    """Oracle Generative AI を使用したテキスト埋め込みクライアント"""
+    
+    def __init__(self):
+        self.client = None
+        self._initialize()
+    
+    def _initialize(self):
+        """Oracle Generative AI クライアントを初期化"""
+        try:
+            config = oci.config.from_file('~/.oci/config', "DEFAULT")
+            self.client = oci.generative_ai_inference.GenerativeAiInferenceClient(
+                config=config,
+                service_endpoint=f"https://inference.generativeai.{settings.OCI_REGION}.oci.oraclecloud.com",
+                retry_strategy=oci.retry.NoneRetryStrategy(),
+                timeout=(10, 240)
+            )
+            logger.info("Oracle Generative AI テキストクライアント初期化成功")
+        except Exception as e:
+            logger.error("Oracle Generative AI テキストクライアント初期化失敗", error=str(e))
+            self.client = None
+    
+    def is_initialized(self) -> bool:
+        """クライアント初期化状態をチェック"""
+        return self.client is not None
+    
+    def generate_embedding(self, text: str) -> Optional[np.ndarray]:
+        """テキストから埋め込みベクトルを生成（3回リトライ付き）"""
+        try:
+            if not self.is_initialized():
+                logger.error("Oracle Generative AI クライアントが初期化されていません")
+                return None
+            
+            # 埋め込みリクエストを作成
+            embed_text_detail = oci.generative_ai_inference.models.EmbedTextDetails()
+            embed_text_detail.serving_mode = oci.generative_ai_inference.models.OnDemandServingMode(
+                model_id=settings.OCI_COHERE_EMBED_MODEL
+            )
+            embed_text_detail.input_type = "SEARCH_QUERY"  # テキスト検索用
+            embed_text_detail.inputs = [text]
+            embed_text_detail.truncate = settings.OCI_EMBEDDING_TRUNCATE
+            embed_text_detail.compartment_id = settings.OCI_COMPARTMENT_OCID
+            
+            # リトライロジック（3回）
+            max_retries = settings.OCI_EMBEDDING_MAX_RETRIES
+            retry_count = 0
+            
+            while retry_count < max_retries:
+                try:
+                    logger.info(f"テキスト埋め込み生成試行 {retry_count + 1}/{max_retries}", text=text[:100])
+                    response = self.client.embed_text(embed_text_detail)
+                    
+                    if response.data.embeddings:
+                        embedding = response.data.embeddings[0]
+                        embedding_array = np.array(embedding, dtype=np.float32)
+                        
+                        logger.info("テキスト埋め込みベクトル生成成功", 
+                                   text_length=len(text),
+                                   embedding_shape=embedding_array.shape,
+                                   embedding_norm=float(np.linalg.norm(embedding_array)))
+                        return embedding_array
+                    else:
+                        logger.error("埋め込みベクトルが空です")
+                        return None
+                        
+                except Exception as e:
+                    retry_count += 1
+                    logger.warning(f"テキスト埋め込み生成エラー: {e}. リトライ中 ({retry_count}/{max_retries})...")
+                    if retry_count < max_retries:
+                        time.sleep(settings.OCI_EMBEDDING_RETRY_DELAY * retry_count)
+                    else:
+                        logger.error("テキスト埋め込み生成の最大リトライ回数に達しました")
+                        return None
+            
+            return None
+            
+        except Exception as e:
+            logger.error("テキスト埋め込み生成中に予期しないエラー", error=str(e), text=text[:100])
+            return None
+
+
 # グローバルクライアント
 db_client = DatabaseClient()
 image_embedder = ImageEmbedder()
+text_embedder = TextEmbedder()
 
 
 def allowed_file(filename: str) -> bool:
@@ -1117,9 +1170,16 @@ def create_app(config_name: str = None) -> Flask:
             
             logger.info("画像検索開始", query=query, limit=limit, threshold=threshold)
             
+            # テキストから埋め込みベクトルを生成（3回リトライ）
+            query_embedding = text_embedder.generate_embedding(query.strip())
+            
+            if query_embedding is None:
+                logger.error("テキスト埋め込み生成失敗", query=query)
+                return jsonify({'error': 'テキストの埋め込み生成に失敗しました'}), 500
+            
             # 類似画像検索を実行
             results = db_client.search_similar_images(
-                query=query.strip(),
+                query_embedding=query_embedding,
                 limit=limit,
                 threshold=threshold
             )
