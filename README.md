@@ -106,7 +106,7 @@ cp .env.example .env
 OCI_CONFIG_FILE=~/.oci/config
 OCI_PROFILE=DEFAULT
 OCI_BUCKET=your-bucket-name
-OCI_REGION=ap-osaka-1
+OCI_REGION=us-chicago-1
 
 # セキュリティ
 SECRET_KEY=your-super-secret-key
@@ -127,7 +127,7 @@ user=ocid1.user.oc1..aaaaaaaa...
 fingerprint=12:34:56:78:90:ab:cd:ef...
 key_file=~/.oci/oci_api_key.pem
 tenancy=ocid1.tenancy.oc1..aaaaaaaa...
-region=ap-osaka-1
+region=us-chicago-1
 ```
 
 #### OCI IAM ポリシー設定
@@ -268,5 +268,6 @@ OCI接続が初期化されていません
 - OCI IAM ポリシーの読み取り権限を確認
 
 ## 📝 ライセンス
+
 
 このプロジェクトは MIT ライセンスの下で公開されています。
