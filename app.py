@@ -1073,6 +1073,13 @@ def create_app(config_name: str = None) -> Flask:
             if not db_client.is_connected():
                 logger.error("Vectorization failed - Database connection error")
                 return jsonify({'error': 'Database connection error'}), 500
+            
+            # Ensure IMG_EMBEDDINGS table exists
+            if not db_client._table_exists():
+                logger.warning("IMG_EMBEDDINGS table not found in /vectorize endpoint, attempting to create...")
+                if not db_client._create_table():
+                    logger.error("Failed to create IMG_EMBEDDINGS table")
+                    return jsonify({'error': 'Database table creation failed'}), 500
 
             # Get request data
             if request.is_json:
