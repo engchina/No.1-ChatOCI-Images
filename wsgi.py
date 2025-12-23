@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-WSGI エントリーポイント
-本番環境でのアプリケーション起動用
+WSGI Entry Point
+For application startup in production environment
 """
 
 import os
 from app import create_app, create_production_app, create_development_app
 
-# 環境に応じたアプリケーション作成
+# Create application based on environment
 env = os.getenv('FLASK_ENV', 'production')
 
 if env == 'production':
@@ -17,10 +17,10 @@ elif env == 'development':
 else:
     application = create_app(env)
 
-# Gunicorn用のエイリアス
+# Alias for Gunicorn
 app = application
 
 if __name__ == "__main__":
-    # 開発サーバーでの起動
+    # Start with development server
     port = int(os.getenv('PORT', 5000))
     application.run(host='0.0.0.0', port=port, debug=(env == 'development'))
