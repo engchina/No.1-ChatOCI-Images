@@ -1358,14 +1358,14 @@ def create_app(config_name: str = None) -> Flask:
             logger.error("Unexpected error during search processing", query=query, error=str(e))
             return jsonify({'error': 'Search processing failed'}), 500
 
-    @app.route('/api/upload/ppt', methods=['POST'])
+    @app.route('/api/upload/document', methods=['POST'])
     @limiter.limit(settings.RATELIMIT_UPLOAD)
-    def upload_ppt():
+    def upload_document():
         """
-        Endpoint to upload PPT/PPTX files to OCI Object Storage
+        Endpoint to upload PPT/PPTX/PDF files to OCI Object Storage
         
         Request:
-            - file: PPT/PPTX file to upload (required)
+            - file: PPT/PPTX/PDF file to upload (required)
             - bucket (optional): Destination bucket name
             - folder (optional): Destination folder
             - filename (optional): Custom filename (including extension)
@@ -1373,7 +1373,7 @@ def create_app(config_name: str = None) -> Flask:
         Returns:
             Upload result and access URL
         """
-        logger.info("Received PPT/PPTX file upload request")
+        logger.info("Received PPT/PPTX/PDF file upload request")
         
         try:
             # Check OCI connection
@@ -1418,13 +1418,13 @@ def create_app(config_name: str = None) -> Flask:
                 )
                 return jsonify(response), status_code
             
-            # PPT/PPTX exclusive check
+            # PPT/PPTX/PDF exclusive check
             file_extension = file.filename.rsplit('.', 1)[1].lower() if '.' in file.filename else ''
-            if file_extension not in ['ppt', 'pptx']:
-                logger.warning(f"Non-PPT/PPTX file format: {file.filename}")
+            if file_extension not in ['ppt', 'pptx', 'pdf']:
+                logger.warning(f"Non-PPT/PPTX/PDF file format: {file.filename}")
                 response, status_code = create_response(
                     success=False,
-                    message='Only PPT/PPTX files can be uploaded',
+                    message='Only PPT/PPTX/PDF files can be uploaded',
                     status_code=400
                 )
                 return jsonify(response), status_code
@@ -1467,13 +1467,15 @@ def create_app(config_name: str = None) -> Flask:
             file_data = file.stream
             content_type = file.content_type or 'application/vnd.ms-powerpoint'
             
-            # Set more appropriate MIME type for PPTX
+            # Set more appropriate MIME type based on extension
             if file_extension == 'pptx':
                 content_type = 'application/vnd.openxmlformats-officedocument.presentationml.presentation'
             elif file_extension == 'ppt':
                 content_type = 'application/vnd.ms-powerpoint'
+            elif file_extension == 'pdf':
+                content_type = 'application/pdf'
             
-            logger.info("PPT/PPTX upload started",
+            logger.info("PPT/PPTX/PDF upload started",
                        bucket=bucket,
                        object=object_name,
                        size=file_size,
@@ -1490,11 +1492,11 @@ def create_app(config_name: str = None) -> Flask:
             # Generate proxy URL
             proxy_url = f"/img/{bucket}/{object_name}"
             
-            logger.info("PPT/PPTX upload successful", object=object_name)
+            logger.info("PPT/PPTX/PDF upload successful", object=object_name)
             
             response, status_code = create_response(
                 success=True,
-                message='PPT/PPTX file upload completed',
+                message='PPT/PPTX/PDF file upload completed',
                 data={
                     'object_name': object_name,
                     'bucket': bucket,
@@ -1516,7 +1518,7 @@ def create_app(config_name: str = None) -> Flask:
             )
             return jsonify(response), status_code
         except Exception as e:
-            logger.error("Unexpected error during PPT/PPTX upload", error=str(e))
+            logger.error("Unexpected error during PPT/PPTX/PDF upload", error=str(e))
             response, status_code = create_response(
                 success=False,
                 message='Upload failed',
