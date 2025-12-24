@@ -52,3 +52,4 @@ urllib3==2.5.0
 Werkzeug==3.0.6
 wheel==0.45.1
 wrapt==1.17.2
+img2pdf==0.6.1

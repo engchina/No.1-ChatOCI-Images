@@ -50,7 +50,7 @@ class Settings(BaseSettings):
     # Security configuration
     MAX_CONTENT_LENGTH: int = Field(default=16 * 1024 * 1024, description="Maximum upload size (16MB)")
     ALLOWED_EXTENSIONS: List[str] = Field(
-        default=['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg', 'ppt', 'pptx', 'pdf'],
+        default=['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg', 'ppt', 'pptx', 'pdf', 'doc', 'docx', 'xls', 'xlsx'],
         description="Allowed file extensions"
     )
     ALLOW_PRIVATE_IPS: bool = Field(default=True, description="Allow image fetching from private IP addresses")

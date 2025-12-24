@@ -23,6 +23,9 @@ import io
 import requests
 from urllib.parse import urlparse
 import mimetypes
+import subprocess
+import shutil
+import tempfile
 
 from flask import Flask, Response, request, jsonify, send_from_directory
 from flask_cors import CORS
@@ -609,6 +612,121 @@ def allowed_file(filename: str) -> bool:
     return allowed
 
 
+def convert_office_to_pdf(input_path: str, output_dir: str) -> str:
+    """Convert Office file to PDF using LibreOffice
+    
+    Args:
+        input_path: Path to input Office file
+        output_dir: Output directory for PDF file
+        
+    Returns:
+        str: Path to converted PDF file
+        
+    Raises:
+        RuntimeError: If conversion fails
+    """
+    if not os.path.exists(input_path):
+        raise FileNotFoundError(f"Input file not found: {input_path}")
+    
+    # Create output directory if it doesn't exist
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # LibreOffice conversion command
+    cmd = [
+        'soffice',
+        '--headless',
+        '--convert-to', 'pdf',
+        '--outdir', str(output_dir),
+        str(input_path)
+    ]
+    
+    try:
+        logger.info("Starting LibreOffice conversion", input=input_path, output_dir=output_dir)
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=300,  # 5 minute timeout
+            check=True
+        )
+        logger.info("LibreOffice conversion completed", input=input_path)
+    except subprocess.TimeoutExpired:
+        logger.error("LibreOffice conversion timeout", input=input_path)
+        raise RuntimeError("LibreOffice conversion timed out")
+    except subprocess.CalledProcessError as e:
+        error_msg = e.stderr.decode() if e.stderr else str(e)
+        logger.error("LibreOffice conversion error", input=input_path, error=error_msg)
+        raise RuntimeError(f"LibreOffice conversion error: {error_msg}")
+    except FileNotFoundError:
+        logger.error("LibreOffice not found. Please install LibreOffice.")
+        raise RuntimeError("LibreOffice is not installed or not in PATH")
+    
+    # Check if conversion was successful
+    base_name = os.path.splitext(os.path.basename(input_path))[0]
+    pdf_path = os.path.join(output_dir, base_name + ".pdf")
+    
+    if not os.path.exists(pdf_path):
+        logger.error("PDF file not created after conversion", expected_path=pdf_path)
+        raise RuntimeError("Office file could not be converted to PDF")
+    
+    logger.info("PDF file created successfully", pdf_path=pdf_path)
+    return pdf_path
+
+
+def convert_image_to_pdf_file(input_path: str, output_dir: str) -> str:
+    """Convert image to PDF using img2pdf
+    
+    Args:
+        input_path: Path to input image file
+        output_dir: Output directory for PDF file
+        
+    Returns:
+        str: Path to converted PDF file
+        
+    Raises:
+        RuntimeError: If conversion fails
+    """
+    if not os.path.exists(input_path):
+        raise FileNotFoundError(f"Input image file not found: {input_path}")
+    
+    # Create output directory if it doesn't exist
+    os.makedirs(output_dir, exist_ok=True)
+    
+    base_name = os.path.basename(input_path)
+    pic_name, _ = os.path.splitext(base_name)
+    output_path = os.path.join(output_dir, f"{pic_name}.pdf")
+    
+    try:
+        import img2pdf
+        from PIL import Image
+        
+        logger.info("Starting image to PDF conversion", input=input_path)
+        
+        # Validate image
+        with Image.open(input_path) as img:
+            # Convert to RGB if necessary
+            if img.mode not in ('RGB', 'L'):
+                img = img.convert('RGB')
+            
+            # Save as temporary JPEG
+            temp_path = os.path.join(output_dir, f"temp_{pic_name}.jpg")
+            img.save(temp_path, 'JPEG', quality=95)
+            
+            # Convert to PDF
+            with open(output_path, "wb") as f:
+                f.write(img2pdf.convert([temp_path]))
+            
+            # Remove temporary file
+            os.remove(temp_path)
+        
+        logger.info("Image to PDF conversion completed", output=output_path)
+        return output_path
+        
+    except Exception as e:
+        logger.error("Image to PDF conversion error", input=input_path, error=str(e))
+        raise RuntimeError(f"Image to PDF conversion error: {str(e)}")
+
+
 def create_response(success: bool, message: str, data: Optional[dict] = None, status_code: int = 200) -> Tuple[dict, int]:
     """Create unified API response format
     
@@ -838,6 +956,8 @@ def create_app(config_name: str = None) -> Flask:
             'endpoints': {
                 'image_proxy': '/img/<bucket>/<object_name>',
                 'upload': '/upload (POST)',
+                'upload_document': '/api/upload/document (POST)',
+                'convert_office': '/api/convert/office (POST)',
                 'health': '/health',
                 'test': '/test'
             }
@@ -1525,6 +1645,129 @@ def create_app(config_name: str = None) -> Flask:
                 status_code=500
             )
             return jsonify(response), status_code
+
+    @app.route('/api/convert/office', methods=['POST'])
+    @limiter.limit("10 per minute")
+    def convert_office_endpoint():
+        """
+        Endpoint to convert Office files to PDF
+        
+        Request:
+            - file: Office file to convert (required)
+            
+        Returns:
+            PDF file (binary data)
+        """
+        logger.info("Received Office file conversion request")
+        
+        # Check if file is included in request
+        if 'file' not in request.files:
+            logger.warning("File not included in request")
+            response, status_code = create_response(
+                success=False,
+                message='File not specified',
+                status_code=400
+            )
+            return jsonify(response), status_code
+        
+        file = request.files['file']
+        
+        # Check if file is selected
+        if file.filename == '':
+            logger.warning("File not selected")
+            response, status_code = create_response(
+                success=False,
+                message='File not selected',
+                status_code=400
+            )
+            return jsonify(response), status_code
+        
+        # Check file extension
+        if not allowed_file(file.filename):
+            logger.warning(f"Unsupported file format: {file.filename}")
+            response, status_code = create_response(
+                success=False,
+                message=f'Unsupported file format. Allowed formats: {", ".join(settings.ALLOWED_EXTENSIONS)}',
+                status_code=400
+            )
+            return jsonify(response), status_code
+        
+        # Office file exclusive check
+        file_extension = file.filename.rsplit('.', 1)[1].lower() if '.' in file.filename else ''
+        allowed_office_extensions = ['docx', 'pptx', 'xlsx', 'doc', 'ppt', 'xls']
+        
+        if file_extension not in allowed_office_extensions:
+            logger.warning(f"Non-Office file format: {file.filename}")
+            response, status_code = create_response(
+                success=False,
+                message=f'Unsupported file format. Allowed formats: {", ".join(allowed_office_extensions)}',
+                status_code=400
+            )
+            return jsonify(response), status_code
+        
+        # Create temporary directory for processing
+        temp_dir = tempfile.mkdtemp()
+        input_path = None
+        pdf_path = None
+        
+        try:
+            # Save uploaded file to temporary location
+            input_filename = f"{uuid.uuid4().hex}_{file.filename}"
+            input_path = os.path.join(temp_dir, input_filename)
+            file.save(input_path)
+            
+            logger.info("File saved to temporary location", path=input_path)
+            
+            # Convert to PDF
+            pdf_path = convert_office_to_pdf(input_path, temp_dir)
+            
+            # Get original filename without extension
+            original_name = os.path.splitext(file.filename)[0]
+            download_name = f"{original_name}.pdf"
+            
+            logger.info("Sending PDF file", pdf_path=pdf_path, download_name=download_name)
+            
+            # Return PDF file
+            return send_from_directory(
+                directory=os.path.dirname(pdf_path),
+                path=os.path.basename(pdf_path),
+                as_attachment=True,
+                download_name=download_name,
+                mimetype='application/pdf'
+            )
+            
+        except FileNotFoundError as e:
+            logger.error("File not found error", error=str(e))
+            response, status_code = create_response(
+                success=False,
+                message=str(e),
+                status_code=404
+            )
+            return jsonify(response), status_code
+        except RuntimeError as e:
+            logger.error("PDF conversion error", error=str(e))
+            response, status_code = create_response(
+                success=False,
+                message=f'PDF conversion error: {str(e)}',
+                status_code=500
+            )
+            return jsonify(response), status_code
+        except Exception as e:
+            logger.error("Unexpected error during conversion", error=str(e))
+            response, status_code = create_response(
+                success=False,
+                message='Unexpected error occurred',
+                status_code=500
+            )
+            return jsonify(response), status_code
+        finally:
+            # Clean up temporary files
+            try:
+                if temp_dir and os.path.exists(temp_dir):
+                    shutil.rmtree(temp_dir)
+                    logger.info("Temporary directory cleaned up", temp_dir=temp_dir)
+            except Exception as e:
+                logger.warning("Failed to clean up temporary directory", temp_dir=temp_dir, error=str(e))
 
     @app.route('/health')
     def health_check():
