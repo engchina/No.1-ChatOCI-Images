@@ -21,7 +21,7 @@ from typing import Optional, Tuple
 import time
 import io
 import requests
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote, unquote
 import mimetypes
 import subprocess
 import shutil
@@ -130,17 +130,29 @@ class OCIClient:
             object_name=object_name
         )
 
-    def put_object(self, bucket_name: str, object_name: str, data, content_type: str = None):
-        """Upload object"""
+    def put_object(self, bucket_name: str, object_name: str, data, content_type: str = None, metadata: dict = None):
+        """Upload object
+        
+        Args:
+            bucket_name: Bucket name
+            object_name: Object name (supports Japanese and spaces)
+            data: File data
+            content_type: Content type
+            metadata: Custom metadata (e.g., original filename)
+        """
         if not self.is_connected():
             raise RuntimeError("OCI client is not initialized")
 
+        # Prepare metadata
+        opc_meta = metadata if metadata else {}
+        
         return self.client.put_object(
             namespace_name=self.namespace,
             bucket_name=bucket_name,
             object_name=object_name,
             put_object_body=data,
-            content_type=content_type
+            content_type=content_type,
+            opc_meta=opc_meta
         )
 
 
@@ -978,10 +990,11 @@ def create_app(config_name: str = None) -> Flask:
     def serve_image(bucket, obj):
         """
         Proxy endpoint to retrieve and return images from OCI Object Storage
+        Supports Japanese filenames and spaces through URL encoding
 
         Args:
             bucket: Bucket name
-            obj: Object name (including path)
+            obj: Object name (URL-encoded if contains Japanese/spaces)
 
         Returns:
             Image data or error response
@@ -992,22 +1005,38 @@ def create_app(config_name: str = None) -> Flask:
                 logger.error("Image retrieval failed - OCI connection error")
                 return jsonify({'error': 'OCI connection error'}), 500
 
-            logger.info("Image retrieval started", bucket=bucket, object=obj)
+            # URL decode the object name to handle Japanese and spaces
+            decoded_obj = unquote(obj)
+            logger.info("Image retrieval started", bucket=bucket, object=decoded_obj)
 
             # Get object
-            response = oci_client.get_object(bucket, obj)
+            response = oci_client.get_object(bucket, decoded_obj)
 
             # Get Content-Type (default to image)
             content_type = response.headers.get('Content-Type', 'image/jpeg')
+            
+            # Get original filename from metadata or use object name
+            metadata = response.headers
+            original_filename = metadata.get('opc-meta-original-filename', decoded_obj.split("/")[-1])
 
-            logger.info("Image retrieval successful", object=obj, content_type=content_type)
+            logger.info("Image retrieval successful", object=decoded_obj, content_type=content_type)
+
+            # Encode filename for Content-Disposition header (RFC 5987)
+            # Support both ASCII and non-ASCII filenames
+            try:
+                filename_ascii = original_filename.encode('ascii')
+                content_disposition = f'inline; filename="{original_filename}"'
+            except UnicodeEncodeError:
+                # Use RFC 5987 encoding for non-ASCII filenames
+                filename_encoded = quote(original_filename)
+                content_disposition = f"inline; filename*=UTF-8''{filename_encoded}"
 
             return Response(
                 response.data.content,
                 mimetype=content_type,
                 headers={
                     'Cache-Control': 'max-age=3600',  # Cache for 1 hour
-                    'Content-Disposition': f'inline; filename="{obj.split("/")[-1]}"'
+                    'Content-Disposition': content_disposition
                 }
             )
 
@@ -1158,17 +1187,28 @@ def create_app(config_name: str = None) -> Flask:
                        size=file_size,
                        source="url" if image_url else "file")
 
-            # Upload to OCI Object Storage
+            # Prepare metadata with original filename
+            # Extract original filename from object_name (format: 原ファイル名_序列号.png or custom filename)
+            original_basename = unique_filename  # This is the actual filename stored
+            upload_metadata = {
+                'original-filename': original_basename,
+                'upload-source': 'url' if image_url else 'file',
+                'uploaded-at': datetime.now().isoformat()
+            }
+            
+            # Upload to OCI Object Storage with metadata
             oci_client.put_object(
                 bucket_name=bucket,
                 object_name=object_name,
                 data=image_data,
-                content_type=content_type
+                content_type=content_type,
+                metadata=upload_metadata
             )
             time.sleep(7)
 
-            # Generate proxy URL
-            proxy_url = f"/img/{bucket}/{object_name}"
+            # Generate proxy URL (URL encode the object name for Japanese/spaces support)
+            encoded_object_name = quote(object_name, safe='')
+            proxy_url = f"/img/{bucket}/{encoded_object_name}"
 
             logger.info("Upload successful", object=object_name)
 
@@ -1595,22 +1635,31 @@ def create_app(config_name: str = None) -> Flask:
             elif file_extension == 'pdf':
                 content_type = 'application/pdf'
             
+            # Prepare upload metadata
+            upload_metadata = {
+                'original-filename': unique_filename,
+                'upload-source': 'document',
+                'uploaded-at': datetime.now().isoformat()
+            }
+            
             logger.info("PPT/PPTX/PDF upload started",
                        bucket=bucket,
                        object=object_name,
                        size=file_size,
                        content_type=content_type)
             
-            # Upload to OCI Object Storage
+            # Upload to OCI Object Storage with metadata
             oci_client.put_object(
                 bucket_name=bucket,
                 object_name=object_name,
                 data=file_data,
-                content_type=content_type
+                content_type=content_type,
+                metadata=upload_metadata
             )
             
-            # Generate proxy URL
-            proxy_url = f"/img/{bucket}/{object_name}"
+            # Generate proxy URL (URL encode the object name for Japanese/spaces support)
+            encoded_object_name = quote(object_name, safe='')
+            proxy_url = f"/img/{bucket}/{encoded_object_name}"
             
             logger.info("PPT/PPTX/PDF upload successful", object=object_name)
             
