@@ -139,12 +139,28 @@ class OCIClient:
             data: File data
             content_type: Content type
             metadata: Custom metadata (e.g., original filename)
+                     Note: Metadata values with non-ASCII characters will be base64-encoded
         """
         if not self.is_connected():
             raise RuntimeError("OCI client is not initialized")
 
-        # Prepare metadata
-        opc_meta = metadata if metadata else {}
+        # Prepare metadata - encode non-ASCII values to base64
+        opc_meta = {}
+        if metadata:
+            for key, value in metadata.items():
+                try:
+                    # Try to encode as latin-1 (HTTP header requirement)
+                    value.encode('latin-1')
+                    opc_meta[key] = value
+                except (UnicodeEncodeError, AttributeError):
+                    # If contains non-ASCII or not a string, base64 encode it
+                    if isinstance(value, str):
+                        # Base64 encode and add prefix to indicate encoding
+                        encoded_value = base64.b64encode(value.encode('utf-8')).decode('ascii')
+                        opc_meta[f"{key}-b64"] = encoded_value
+                        logger.debug(f"Encoded metadata key '{key}' to base64")
+                    else:
+                        opc_meta[key] = str(value)
         
         return self.client.put_object(
             namespace_name=self.namespace,
@@ -1015,9 +1031,22 @@ def create_app(config_name: str = None) -> Flask:
             # Get Content-Type (default to image)
             content_type = response.headers.get('Content-Type', 'image/jpeg')
             
-            # Get original filename from metadata or use object name
+            # Get original filename from metadata (check both base64 and plain versions)
             metadata = response.headers
-            original_filename = metadata.get('opc-meta-original-filename', decoded_obj.split("/")[-1])
+            original_filename = None
+            
+            # Check for base64-encoded original filename
+            if 'opc-meta-original-filename-b64' in metadata:
+                try:
+                    encoded_value = metadata['opc-meta-original-filename-b64']
+                    original_filename = base64.b64decode(encoded_value).decode('utf-8')
+                    logger.debug(f"Decoded base64 filename: {original_filename}")
+                except Exception as e:
+                    logger.warning(f"Failed to decode base64 filename: {e}")
+            
+            # Fallback to plain original filename or object name
+            if not original_filename:
+                original_filename = metadata.get('opc-meta-original-filename', decoded_obj.split("/")[-1])
 
             logger.info("Image retrieval successful", object=decoded_obj, content_type=content_type)
 
