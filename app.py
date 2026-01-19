@@ -1554,10 +1554,10 @@ def create_app(config_name: str = None) -> Flask:
     @limiter.limit(settings.RATELIMIT_UPLOAD)
     def upload_document():
         """
-        Endpoint to upload PPT/PPTX/PDF files to OCI Object Storage
+        Endpoint to upload PPT/PPTX/PDF/PNG/JPEG/JPG files to OCI Object Storage
         
         Request:
-            - file: PPT/PPTX/PDF file to upload (required)
+            - file: PPT/PPTX/PDF/PNG/JPEG/JPG file to upload (required)
             - bucket (optional): Destination bucket name
             - folder (optional): Destination folder
             - filename (optional): Custom filename (including extension)
@@ -1565,7 +1565,7 @@ def create_app(config_name: str = None) -> Flask:
         Returns:
             Upload result and access URL
         """
-        logger.info("Received PPT/PPTX/PDF file upload request")
+        logger.info("Received document/image file upload request")
         
         try:
             # Check OCI connection
@@ -1610,13 +1610,14 @@ def create_app(config_name: str = None) -> Flask:
                 )
                 return jsonify(response), status_code
             
-            # PPT/PPTX/PDF exclusive check
+            # PPT/PPTX/PDF/PNG/JPEG/JPG check
             file_extension = file.filename.rsplit('.', 1)[1].lower() if '.' in file.filename else ''
-            if file_extension not in ['ppt', 'pptx', 'pdf']:
-                logger.warning(f"Non-PPT/PPTX/PDF file format: {file.filename}")
+            allowed_document_extensions = ['ppt', 'pptx', 'pdf', 'png', 'jpeg', 'jpg']
+            if file_extension not in allowed_document_extensions:
+                logger.warning(f"Unsupported file format: {file.filename}")
                 response, status_code = create_response(
                     success=False,
-                    message='Only PPT/PPTX/PDF files can be uploaded',
+                    message=f'Unsupported file format. Allowed formats: {", ".join(allowed_document_extensions)}',
                     status_code=400
                 )
                 return jsonify(response), status_code
@@ -1657,7 +1658,7 @@ def create_app(config_name: str = None) -> Flask:
             
             # Set file data and content type
             file_data = file.stream
-            content_type = file.content_type or 'application/vnd.ms-powerpoint'
+            content_type = file.content_type or 'application/octet-stream'
             
             # Set more appropriate MIME type based on extension
             if file_extension == 'pptx':
@@ -1666,6 +1667,10 @@ def create_app(config_name: str = None) -> Flask:
                 content_type = 'application/vnd.ms-powerpoint'
             elif file_extension == 'pdf':
                 content_type = 'application/pdf'
+            elif file_extension == 'png':
+                content_type = 'image/png'
+            elif file_extension in ['jpeg', 'jpg']:
+                content_type = 'image/jpeg'
             
             # Prepare upload metadata
             upload_metadata = {
@@ -1674,11 +1679,12 @@ def create_app(config_name: str = None) -> Flask:
                 'uploaded-at': datetime.now().isoformat()
             }
             
-            logger.info("PPT/PPTX/PDF upload started",
+            logger.info("Document/Image upload started",
                        bucket=bucket,
                        object=object_name,
                        size=file_size,
-                       content_type=content_type)
+                       content_type=content_type,
+                       file_extension=file_extension)
             
             # Upload to OCI Object Storage with metadata
             oci_client.put_object(
@@ -1693,11 +1699,11 @@ def create_app(config_name: str = None) -> Flask:
             encoded_object_name = quote(object_name, safe='')
             proxy_url = f"/img/{bucket}/{encoded_object_name}"
             
-            logger.info("PPT/PPTX/PDF upload successful", object=object_name)
+            logger.info("Document/Image upload successful", object=object_name, file_extension=file_extension)
             
             response, status_code = create_response(
                 success=True,
-                message='PPT/PPTX/PDF file upload completed',
+                message='File upload completed',
                 data={
                     'object_name': object_name,
                     'bucket': bucket,
@@ -1719,7 +1725,7 @@ def create_app(config_name: str = None) -> Flask:
             )
             return jsonify(response), status_code
         except Exception as e:
-            logger.error("Unexpected error during PPT/PPTX/PDF upload", error=str(e))
+            logger.error("Unexpected error during document/image upload", error=str(e))
             response, status_code = create_response(
                 success=False,
                 message='Upload failed',
@@ -1731,10 +1737,10 @@ def create_app(config_name: str = None) -> Flask:
     @limiter.limit("10 per minute")
     def convert_office_endpoint():
         """
-        Endpoint to convert Office files to PDF
+        Endpoint to convert Office files and images to PDF
         
         Request:
-            - file: Office file to convert (required)
+            - file: Office file or image file to convert (required)
             
         Returns:
             PDF file (binary data)
@@ -1773,15 +1779,15 @@ def create_app(config_name: str = None) -> Flask:
             )
             return jsonify(response), status_code
         
-        # Office file exclusive check
+        # Office file and image file check
         file_extension = file.filename.rsplit('.', 1)[1].lower() if '.' in file.filename else ''
-        allowed_office_extensions = ['docx', 'pptx', 'xlsx', 'doc', 'ppt', 'xls']
+        allowed_conversion_extensions = ['docx', 'pptx', 'xlsx', 'doc', 'ppt', 'xls', 'png', 'jpeg', 'jpg']
         
-        if file_extension not in allowed_office_extensions:
-            logger.warning(f"Non-Office file format: {file.filename}")
+        if file_extension not in allowed_conversion_extensions:
+            logger.warning(f"Unsupported file format: {file.filename}")
             response, status_code = create_response(
                 success=False,
-                message=f'Unsupported file format. Allowed formats: {", ".join(allowed_office_extensions)}',
+                message=f'Unsupported file format. Allowed formats: {", ".join(allowed_conversion_extensions)}',
                 status_code=400
             )
             return jsonify(response), status_code
@@ -1799,8 +1805,14 @@ def create_app(config_name: str = None) -> Flask:
             
             logger.info("File saved to temporary location", path=input_path)
             
-            # Convert to PDF
-            pdf_path = convert_office_to_pdf(input_path, temp_dir)
+            # Convert to PDF based on file type
+            image_extensions = ['png', 'jpeg', 'jpg']
+            if file_extension in image_extensions:
+                # Convert image to PDF
+                pdf_path = convert_image_to_pdf_file(input_path, temp_dir)
+            else:
+                # Convert Office file to PDF
+                pdf_path = convert_office_to_pdf(input_path, temp_dir)
             
             # Get original filename without extension
             original_name = os.path.splitext(file.filename)[0]
