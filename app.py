@@ -99,9 +99,12 @@ class OCIClient:
                 profile_name=settings.OCI_PROFILE
             )
 
-            # Configure region
-            if settings.OCI_REGION:
-                config['region'] = settings.OCI_REGION
+            # Configure region for Object Storage
+            # Use OCI_OBJECT_STORAGE_REGION if specified, otherwise fall back to OCI_REGION
+            object_storage_region = settings.OCI_OBJECT_STORAGE_REGION or settings.OCI_REGION
+            if object_storage_region:
+                config['region'] = object_storage_region
+                logger.info("Using Object Storage region", region=object_storage_region)
 
             self.client = ObjectStorageClient(config)
             self.namespace = self.client.get_namespace().data

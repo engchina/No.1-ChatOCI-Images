@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     OCI_PROFILE: str = Field(default="DEFAULT", description="OCI config profile")
     OCI_BUCKET: str = Field(default="chatbot-images", description="Default bucket name")
     OCI_REGION: Optional[str] = Field(default=None, description="OCI region")
+    OCI_OBJECT_STORAGE_REGION: Optional[str] = Field(default=None, description="OCI Object Storage region (if different from OCI_REGION)")
     OCI_COMPARTMENT_OCID: Optional[str] = Field(default=None, description="OCI compartment OCID")
 
     # Oracle database configuration
