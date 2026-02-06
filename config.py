@@ -73,9 +73,11 @@ class Settings(BaseSettings):
     CORS_METHODS: List[str] = Field(default=["GET", "POST", "OPTIONS"], description="CORS allowed methods")
 
     # Rate limiting configuration
+    # Note: OCI Object Storage API has much higher limits (thousands per second)
+    # These limits are for protecting against client abuse, not OCI limits
     RATELIMIT_STORAGE_URL: str = Field(default="memory://", description="Rate limit storage")
-    RATELIMIT_DEFAULT: str = Field(default="100 per hour", description="Default rate limit")
-    RATELIMIT_UPLOAD: str = Field(default="10 per minute", description="Upload rate limit")
+    RATELIMIT_DEFAULT: str = Field(default="1000 per hour", description="Default rate limit")
+    RATELIMIT_UPLOAD: str = Field(default="300 per minute", description="Upload rate limit")
 
     # Logging configuration
     LOG_LEVEL: str = Field(default="INFO", description="Log level")
