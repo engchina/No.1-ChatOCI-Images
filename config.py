@@ -45,12 +45,14 @@ class Settings(BaseSettings):
     OCI_EMBEDDING_INPUT_TYPE: str = Field(default="IMAGE", description="Embedding input type")
     OCI_EMBEDDING_TRUNCATE: str = Field(default="NONE", description="Truncation strategy")
     OCI_EMBEDDING_BATCH_SIZE: int = Field(default=1, description="Batch processing size")
-    OCI_EMBEDDING_MAX_RETRIES: int = Field(default=3, description="Maximum retry count")
-    OCI_EMBEDDING_RETRY_DELAY: int = Field(default=10, description="Retry delay (seconds)")
+    OCI_EMBEDDING_MAX_RETRIES: int = Field(default=5, description="Maximum retry count")
+    OCI_EMBEDDING_RETRY_DELAY: int = Field(default=15, description="Base retry delay (seconds)")
     
-    # OCI Generic API configuration
-    OCI_API_MAX_RETRIES: int = Field(default=5, description="Maximum retry count for OCI APIs")
-    OCI_API_RETRY_BASE_DELAY: int = Field(default=2, description="Base retry delay (seconds) for exponential backoff")
+    # OCI API retry configuration (for Object Storage and other OCI services)
+    OCI_API_MAX_RETRIES: int = Field(default=5, description="Maximum retry count for OCI API calls")
+    OCI_API_BASE_DELAY: float = Field(default=2.0, description="Base delay for exponential backoff (seconds)")
+    OCI_API_MAX_DELAY: float = Field(default=60.0, description="Maximum delay between retries (seconds)")
+    OCI_API_JITTER: float = Field(default=0.5, description="Jitter factor for retry delay (0.0-1.0)")
 
     # Security configuration
     MAX_CONTENT_LENGTH: int = Field(default=16 * 1024 * 1024, description="Maximum upload size (16MB)")
@@ -72,8 +74,8 @@ class Settings(BaseSettings):
 
     # Rate limiting configuration
     RATELIMIT_STORAGE_URL: str = Field(default="memory://", description="Rate limit storage")
-    RATELIMIT_DEFAULT: str = Field(default="1000 per hour", description="Default rate limit")
-    RATELIMIT_UPLOAD: str = Field(default="60 per minute", description="Upload rate limit")
+    RATELIMIT_DEFAULT: str = Field(default="100 per hour", description="Default rate limit")
+    RATELIMIT_UPLOAD: str = Field(default="10 per minute", description="Upload rate limit")
 
     # Logging configuration
     LOG_LEVEL: str = Field(default="INFO", description="Log level")

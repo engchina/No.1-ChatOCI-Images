@@ -21,12 +21,12 @@ from typing import Optional, Tuple
 import time
 import io
 import requests
-import functools
 from urllib.parse import urlparse, quote, unquote
 import mimetypes
 import subprocess
 import shutil
 import tempfile
+import random
 
 from flask import Flask, Response, request, jsonify, send_from_directory
 from flask_cors import CORS
@@ -78,52 +78,57 @@ structlog.configure(
 logger = structlog.get_logger(__name__)
 
 
-def retry_oci_api(func):
-    """Decorator to retry OCI API calls on 429 Too Many Requests and 5xx Server Errors"""
-    @functools.wraps(func)
-    def wrapper(*args, **kwargs):
-        # Use new settings with fallbacks
-        max_retries = getattr(settings, 'OCI_API_MAX_RETRIES', 5)
-        base_delay = getattr(settings, 'OCI_API_RETRY_BASE_DELAY', 2)
-        
-        for attempt in range(max_retries + 1):
-            try:
-                return func(*args, **kwargs)
-            except ServiceError as e:
-                # 429: Too Many Requests, 5xx: Server Errors
-                if e.status == 429 or e.status >= 500:
-                    if attempt < max_retries:
-                        # Exponential backoff: 2, 4, 8, 16, 32...
-                        delay = base_delay * (2 ** attempt)
-                        error_type = "Rate Limited (429)" if e.status == 429 else f"Server Error ({e.status})"
-                        
-                        logger.warning(
-                            f"OCI API {error_type}", 
-                            operation=func.__name__, 
-                            attempt=attempt+1, 
-                            max_retries=max_retries,
-                            retry_in=f"{delay}s",
-                            error=str(e)
-                        )
-                        time.sleep(delay)
-                        continue
-                raise
-            except Exception as e:
-                raise
-        return func(*args, **kwargs) # Should not be reached
-    return wrapper
-
-
 class OCIClient:
-    """OCI Object Storage client wrapper"""
+    """OCI Object Storage client wrapper with robust retry logic"""
+    
+    # Retryable HTTP status codes
+    RETRYABLE_STATUS_CODES = [
+        408,  # Request Timeout
+        429,  # Too Many Requests (Rate Limiting)
+        500,  # Internal Server Error
+        502,  # Bad Gateway
+        503,  # Service Unavailable
+        504,  # Gateway Timeout
+    ]
 
     def __init__(self):
         self.client: Optional[ObjectStorageClient] = None
         self.namespace: Optional[str] = None
         self._initialize()
+    
+    def _calculate_retry_delay(self, retry: int) -> float:
+        """Calculate retry delay with exponential backoff and jitter
+        
+        Args:
+            retry: Current retry attempt number (0-indexed)
+            
+        Returns:
+            float: Delay in seconds
+        """
+        base_delay = settings.OCI_API_BASE_DELAY
+        max_delay = settings.OCI_API_MAX_DELAY
+        jitter_factor = settings.OCI_API_JITTER
+        
+        # Exponential backoff: base_delay * (2 ^ retry)
+        delay = base_delay * (2 ** retry)
+        
+        # Apply maximum delay cap
+        delay = min(delay, max_delay)
+        
+        # Add jitter: delay * (1 - jitter_factor + random(0, 2*jitter_factor))
+        # This creates a range of [delay * (1 - jitter_factor), delay * (1 + jitter_factor)]
+        jitter = delay * jitter_factor * (2 * random.random() - 1)
+        delay = delay + jitter
+        
+        # Ensure minimum delay of 1 second
+        return max(1.0, delay)
+    
+    def _is_retryable_error(self, status_code: int) -> bool:
+        """Check if the error status code is retryable"""
+        return status_code in self.RETRYABLE_STATUS_CODES
 
     def _initialize(self):
-        """Initialize OCI client"""
+        """Initialize OCI client with robust retry logic"""
         try:
             # Load OCI configuration
             config_file = os.path.expanduser(settings.OCI_CONFIG_FILE)
@@ -144,7 +149,38 @@ class OCIClient:
                 logger.info("Using Object Storage region", region=object_storage_region)
 
             self.client = ObjectStorageClient(config)
-            self.namespace = self.client.get_namespace().data
+            
+            # Get namespace with retry logic
+            max_retries = settings.OCI_API_MAX_RETRIES
+            
+            for retry in range(max_retries):
+                try:
+                    self.namespace = self.client.get_namespace().data
+                    if retry > 0:
+                        logger.info(f"get_namespace succeeded after {retry + 1} attempts")
+                    break
+                except ServiceError as e:
+                    is_last_attempt = retry >= max_retries - 1
+                    
+                    if self._is_retryable_error(e.status) and not is_last_attempt:
+                        delay = self._calculate_retry_delay(retry)
+                        logger.warning(
+                            f"get_namespace retryable error (HTTP {e.status}), "
+                            f"attempt {retry + 1}/{max_retries}, waiting {delay:.1f}s before retry",
+                            error_code=e.code,
+                            error_message=e.message
+                        )
+                        time.sleep(delay)
+                    else:
+                        logger.error(
+                            f"get_namespace failed after {retry + 1} attempts: {e.message} (HTTP {e.status})",
+                            error_code=e.code
+                        )
+                        raise
+            
+            # Verify namespace was successfully retrieved
+            if self.namespace is None:
+                raise RuntimeError("Failed to retrieve namespace after all retry attempts")
 
             logger.info("OCI connection successful",
                        namespace=self.namespace,
@@ -159,21 +195,78 @@ class OCIClient:
         """Check connection status"""
         return self.client is not None and self.namespace is not None
 
-    @retry_oci_api
     def get_object(self, bucket_name: str, object_name: str):
-        """Get object"""
+        """Get object with robust retry logic for rate limiting and transient errors
+        
+        Handles:
+        - 408 Request Timeout
+        - 429 Too Many Requests (Rate Limiting)
+        - 500 Internal Server Error
+        - 502 Bad Gateway
+        - 503 Service Unavailable
+        - 504 Gateway Timeout
+        """
         if not self.is_connected():
             raise RuntimeError("OCI client is not initialized")
 
-        return self.client.get_object(
-            namespace_name=self.namespace,
-            bucket_name=bucket_name,
-            object_name=object_name
-        )
+        max_retries = settings.OCI_API_MAX_RETRIES
+        
+        for retry in range(max_retries):
+            try:
+                response = self.client.get_object(
+                    namespace_name=self.namespace,
+                    bucket_name=bucket_name,
+                    object_name=object_name
+                )
+                
+                # Success
+                if retry > 0:
+                    logger.info(
+                        f"get_object succeeded after {retry + 1} attempts", 
+                        bucket=bucket_name, 
+                        object=object_name
+                    )
+                return response
+                
+            except ServiceError as e:
+                is_last_attempt = retry >= max_retries - 1
+                
+                if self._is_retryable_error(e.status) and not is_last_attempt:
+                    delay = self._calculate_retry_delay(retry)
+                    logger.warning(
+                        f"get_object retryable error (HTTP {e.status}), "
+                        f"attempt {retry + 1}/{max_retries}, waiting {delay:.1f}s before retry",
+                        bucket=bucket_name,
+                        object=object_name,
+                        error_code=e.code,
+                        error_message=e.message
+                    )
+                    time.sleep(delay)
+                else:
+                    # Non-retryable error or last attempt
+                    logger.error(
+                        f"get_object failed after {retry + 1} attempts: {e.message} (HTTP {e.status})",
+                        bucket=bucket_name,
+                        object=object_name,
+                        error_code=e.code
+                    )
+                    raise
+                    
+            except Exception as e:
+                # Unexpected error - log and raise
+                logger.error(
+                    f"get_object unexpected error: {str(e)}",
+                    bucket=bucket_name,
+                    object=object_name,
+                    attempt=retry + 1
+                )
+                raise
+        
+        # Should not reach here, but just in case
+        raise RuntimeError(f"get_object failed after {max_retries} attempts")
 
-    @retry_oci_api
     def put_object(self, bucket_name: str, object_name: str, data, content_type: str = None, metadata: dict = None):
-        """Upload object
+        """Upload object with robust retry logic for rate limiting and transient errors
         
         Args:
             bucket_name: Bucket name
@@ -182,6 +275,14 @@ class OCIClient:
             content_type: Content type
             metadata: Custom metadata (e.g., original filename)
                      Note: Metadata values with non-ASCII characters will be base64-encoded
+                     
+        Handles:
+        - 408 Request Timeout
+        - 429 Too Many Requests (Rate Limiting)
+        - 500 Internal Server Error
+        - 502 Bad Gateway
+        - 503 Service Unavailable
+        - 504 Gateway Timeout
         """
         if not self.is_connected():
             raise RuntimeError("OCI client is not initialized")
@@ -204,14 +305,100 @@ class OCIClient:
                     else:
                         opc_meta[key] = str(value)
         
-        return self.client.put_object(
-            namespace_name=self.namespace,
-            bucket_name=bucket_name,
-            object_name=object_name,
-            put_object_body=data,
-            content_type=content_type,
-            opc_meta=opc_meta
-        )
+        # Read data into memory for retry support
+        # Handle different data types: stream, bytes, or other
+        data_bytes = None
+        if isinstance(data, bytes):
+            # Data is already bytes
+            data_bytes = data
+            logger.debug(f"Using bytes data ({len(data_bytes)} bytes) for retry support")
+        elif hasattr(data, 'read'):
+            # Data is a stream (file-like object)
+            try:
+                if hasattr(data, 'seek'):
+                    data.seek(0)
+                data_bytes = data.read()
+                logger.debug(f"Read {len(data_bytes)} bytes from stream for retry support")
+            except (AttributeError, OSError) as e:
+                # If not seekable, try to read anyway
+                logger.warning(f"Stream seek failed, attempting direct read: {e}")
+                try:
+                    data_bytes = data.read()
+                except Exception as read_error:
+                    logger.error(f"Failed to read stream data: {read_error}")
+                    raise RuntimeError(f"Cannot read data for upload: {read_error}")
+        
+        # Ensure we have data to upload
+        if data_bytes is None and data is None:
+            raise ValueError("No data provided for upload")
+        
+        max_retries = settings.OCI_API_MAX_RETRIES
+        
+        for retry in range(max_retries):
+            try:
+                # Create fresh BytesIO for each retry attempt
+                if data_bytes is not None:
+                    upload_data = io.BytesIO(data_bytes)
+                else:
+                    # Fallback to original data (may not support retry)
+                    upload_data = data
+                    if retry > 0:
+                        logger.warning("Retry with non-buffered data may fail")
+                
+                response = self.client.put_object(
+                    namespace_name=self.namespace,
+                    bucket_name=bucket_name,
+                    object_name=object_name,
+                    put_object_body=upload_data,
+                    content_type=content_type,
+                    opc_meta=opc_meta
+                )
+                
+                # Success
+                if retry > 0:
+                    logger.info(
+                        f"put_object succeeded after {retry + 1} attempts", 
+                        bucket=bucket_name, 
+                        object=object_name
+                    )
+                return response
+                
+            except ServiceError as e:
+                is_last_attempt = retry >= max_retries - 1
+                
+                if self._is_retryable_error(e.status) and not is_last_attempt:
+                    delay = self._calculate_retry_delay(retry)
+                    logger.warning(
+                        f"put_object retryable error (HTTP {e.status}), "
+                        f"attempt {retry + 1}/{max_retries}, waiting {delay:.1f}s before retry",
+                        bucket=bucket_name,
+                        object=object_name,
+                        error_code=e.code,
+                        error_message=e.message
+                    )
+                    time.sleep(delay)
+                else:
+                    # Non-retryable error or last attempt
+                    logger.error(
+                        f"put_object failed after {retry + 1} attempts: {e.message} (HTTP {e.status})",
+                        bucket=bucket_name,
+                        object=object_name,
+                        error_code=e.code
+                    )
+                    raise
+                    
+            except Exception as e:
+                # Unexpected error - log and raise
+                logger.error(
+                    f"put_object unexpected error: {str(e)}",
+                    bucket=bucket_name,
+                    object=object_name,
+                    attempt=retry + 1
+                )
+                raise
+        
+        # Should not reach here, but just in case
+        raise RuntimeError(f"put_object failed after {max_retries} attempts")
 
 
 # Global OCI client
@@ -521,11 +708,6 @@ class ImageEmbedder:
         base64_string = base64.b64encode(image_bytes).decode('utf-8')
         return f"data:{content_type};base64,{base64_string}"
     
-    @retry_oci_api
-    def _call_embed_text(self, details):
-        """Call embed_text with retry logic"""
-        return self.client.embed_text(details)
-
     def generate_embedding(self, image_data: io.BytesIO, content_type: str = "image/png") -> Optional[np.ndarray]:
         """Generate embedding vector from image"""
         try:
@@ -549,25 +731,34 @@ class ImageEmbedder:
             embed_text_detail.truncate = settings.OCI_EMBEDDING_TRUNCATE
             embed_text_detail.compartment_id = settings.OCI_COMPARTMENT_OCID
             
-            try:
-                # Use decorated method for retry logic
-                response = self._call_embed_text(embed_text_detail)
-                
-                if response.data.embeddings:
-                    embedding = response.data.embeddings[0]
-                    embedding_array = np.array(embedding, dtype=np.float32)
+            # Retry logic
+            max_retries = settings.OCI_EMBEDDING_MAX_RETRIES
+            retry_count = 0
+            
+            while retry_count < max_retries:
+                try:
+                    response = self.client.embed_text(embed_text_detail)
                     
-                    logger.info("Image embedding vector generation successful", 
-                               embedding_shape=embedding_array.shape,
-                               embedding_norm=float(np.linalg.norm(embedding_array)))
-                    return embedding_array
-                else:
-                    logger.error("Embedding vector is empty")
-                    return None
-                    
-            except Exception as e:
-                logger.error("Image embedding generation failed after retries", error=str(e))
-                return None
+                    if response.data.embeddings:
+                        embedding = response.data.embeddings[0]
+                        embedding_array = np.array(embedding, dtype=np.float32)
+                        
+                        logger.info("Image embedding vector generation successful", 
+                                   embedding_shape=embedding_array.shape,
+                                   embedding_norm=float(np.linalg.norm(embedding_array)))
+                        return embedding_array
+                    else:
+                        logger.error("埋め込みベクトルが空です")
+                        return None
+                        
+                except Exception as e:
+                    retry_count += 1
+                    logger.warning(f"Image embedding generation error: {e}. Retrying ({retry_count}/{max_retries})...")
+                    if retry_count < max_retries:
+                        time.sleep(settings.OCI_EMBEDDING_RETRY_DELAY * retry_count)
+                    else:
+                        logger.error("Maximum retry count reached for image embedding generation")
+                        return None
             
             return None
             
@@ -602,11 +793,6 @@ class TextEmbedder:
         """Check client initialization status"""
         return self.client is not None
     
-    @retry_oci_api
-    def _call_embed_text(self, details):
-        """Call embed_text with retry logic"""
-        return self.client.embed_text(details)
-
     def generate_embedding(self, text: str) -> Optional[np.ndarray]:
         """Generate embedding vector from text (with 3 retries)"""
         try:
@@ -624,26 +810,36 @@ class TextEmbedder:
             embed_text_detail.truncate = settings.OCI_EMBEDDING_TRUNCATE
             embed_text_detail.compartment_id = settings.OCI_COMPARTMENT_OCID
             
-            try:
-                # Use decorated method for retry logic
-                response = self._call_embed_text(embed_text_detail)
-                
-                if response.data.embeddings:
-                    embedding = response.data.embeddings[0]
-                    embedding_array = np.array(embedding, dtype=np.float32)
+            # Retry logic (3 times)
+            max_retries = settings.OCI_EMBEDDING_MAX_RETRIES
+            retry_count = 0
+            
+            while retry_count < max_retries:
+                try:
+                    logger.info(f"Text embedding generation attempt {retry_count + 1}/{max_retries}", text=text[:100])
+                    response = self.client.embed_text(embed_text_detail)
                     
-                    logger.info("Text embedding vector generation successful", 
-                               text_length=len(text),
-                               embedding_shape=embedding_array.shape,
-                               embedding_norm=float(np.linalg.norm(embedding_array)))
-                    return embedding_array
-                else:
-                    logger.error("Embedding vector is empty")
-                    return None
-                    
-            except Exception as e:
-                logger.error("Text embedding generation failed after retries", error=str(e), text=text[:100])
-                return None
+                    if response.data.embeddings:
+                        embedding = response.data.embeddings[0]
+                        embedding_array = np.array(embedding, dtype=np.float32)
+                        
+                        logger.info("Text embedding vector generation successful", 
+                                   text_length=len(text),
+                                   embedding_shape=embedding_array.shape,
+                                   embedding_norm=float(np.linalg.norm(embedding_array)))
+                        return embedding_array
+                    else:
+                        logger.error("Embedding vector is empty")
+                        return None
+                        
+                except Exception as e:
+                    retry_count += 1
+                    logger.warning(f"Text embedding generation error: {e}. Retrying ({retry_count}/{max_retries})...")
+                    if retry_count < max_retries:
+                        time.sleep(settings.OCI_EMBEDDING_RETRY_DELAY * retry_count)
+                    else:
+                        logger.error("Maximum retry count reached for text embedding generation")
+                        return None
             
             return None
             
