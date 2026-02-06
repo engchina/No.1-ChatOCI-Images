@@ -72,8 +72,8 @@ class Settings(BaseSettings):
 
     # Rate limiting configuration
     RATELIMIT_STORAGE_URL: str = Field(default="memory://", description="Rate limit storage")
-    RATELIMIT_DEFAULT: str = Field(default="100 per hour", description="Default rate limit")
-    RATELIMIT_UPLOAD: str = Field(default="10 per minute", description="Upload rate limit")
+    RATELIMIT_DEFAULT: str = Field(default="1000 per hour", description="Default rate limit")
+    RATELIMIT_UPLOAD: str = Field(default="60 per minute", description="Upload rate limit")
 
     # Logging configuration
     LOG_LEVEL: str = Field(default="INFO", description="Log level")
