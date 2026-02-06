@@ -33,6 +33,9 @@ class Settings(BaseSettings):
     OCI_REGION: Optional[str] = Field(default=None, description="OCI region")
     OCI_OBJECT_STORAGE_REGION: Optional[str] = Field(default=None, description="OCI Object Storage region (if different from OCI_REGION)")
     OCI_COMPARTMENT_OCID: Optional[str] = Field(default=None, description="OCI compartment OCID")
+    OCI_API_MAX_RETRIES: int = Field(default=6, description="Maximum retry count for OCI API calls")
+    OCI_API_RETRY_BASE_DELAY: float = Field(default=0.5, description="OCI API retry base delay (seconds)")
+    OCI_API_RETRY_MAX_DELAY: float = Field(default=20.0, description="OCI API retry max delay (seconds)")
 
     # Oracle database configuration
     DB_USERNAME: str = Field(default="ADMIN", description="Database username")
