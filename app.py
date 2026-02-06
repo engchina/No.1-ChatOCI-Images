@@ -1501,7 +1501,7 @@ def create_app(config_name: str = None) -> Flask:
             return jsonify({'error': 'Upload failed'}), 500
 
     @app.route('/vectorize', methods=['POST'])
-    @limiter.limit("10 per minute")
+    @limiter.limit(settings.RATELIMIT_UPLOAD)
     def vectorize_image():
         """
         Endpoint to vectorize images
@@ -1682,7 +1682,7 @@ def create_app(config_name: str = None) -> Flask:
             return jsonify({'error': 'Vectorization processing failed'}), 500
 
     @app.route('/search', methods=['POST'])
-    @limiter.limit("20 per minute")
+    @limiter.limit(settings.RATELIMIT_UPLOAD)
     def search_similar_images():
         """
         Endpoint to search for similar images based on text query
@@ -1959,7 +1959,7 @@ def create_app(config_name: str = None) -> Flask:
             return jsonify(response), status_code
 
     @app.route('/api/convert/office', methods=['POST'])
-    @limiter.limit("10 per minute")
+    @limiter.limit(settings.RATELIMIT_UPLOAD)
     def convert_office_endpoint():
         """
         Endpoint to convert Office files and images to PDF
