@@ -33,9 +33,6 @@ class Settings(BaseSettings):
     OCI_REGION: Optional[str] = Field(default=None, description="OCI region")
     OCI_OBJECT_STORAGE_REGION: Optional[str] = Field(default=None, description="OCI Object Storage region (if different from OCI_REGION)")
     OCI_COMPARTMENT_OCID: Optional[str] = Field(default=None, description="OCI compartment OCID")
-    OCI_API_MAX_RETRIES: int = Field(default=6, description="Maximum retry count for OCI API calls")
-    OCI_API_RETRY_BASE_DELAY: float = Field(default=0.5, description="OCI API retry base delay (seconds)")
-    OCI_API_RETRY_MAX_DELAY: float = Field(default=20.0, description="OCI API retry max delay (seconds)")
 
     # Oracle database configuration
     DB_USERNAME: str = Field(default="ADMIN", description="Database username")
@@ -50,6 +47,10 @@ class Settings(BaseSettings):
     OCI_EMBEDDING_BATCH_SIZE: int = Field(default=1, description="Batch processing size")
     OCI_EMBEDDING_MAX_RETRIES: int = Field(default=3, description="Maximum retry count")
     OCI_EMBEDDING_RETRY_DELAY: int = Field(default=10, description="Retry delay (seconds)")
+    
+    # OCI Generic API configuration
+    OCI_API_MAX_RETRIES: int = Field(default=5, description="Maximum retry count for OCI APIs")
+    OCI_API_RETRY_BASE_DELAY: int = Field(default=2, description="Base retry delay (seconds) for exponential backoff")
 
     # Security configuration
     MAX_CONTENT_LENGTH: int = Field(default=16 * 1024 * 1024, description="Maximum upload size (16MB)")
